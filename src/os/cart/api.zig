@@ -209,6 +209,14 @@ pub fn ext_flash_cart_area() ?[]const u8 {
     return all[platform.ext_flash_cart_offset()..];
 }
 
+/// Boot-time detection report, for diagnostics: 0xE2 in the top byte on
+/// firmware with external flash support, then attempts, result
+/// (0 ok, 1 no SFDP signature, 2 not JEDEC, 3 bad density) and the first
+/// SFDP byte read. Anything else means older firmware.
+pub fn ext_flash_diag() u32 {
+    return platform.ext_flash_diag();
+}
+
 pub const ExtFlashError = error{ Unsupported, OutOfRange, Misaligned, BadBuffer };
 
 /// Wire format of external flash requests (see os_abi.EXT_FLASH_REQ).

@@ -785,12 +785,14 @@ fn init_cart_ipc_data() void {
     abi.ipc_data.light_level = .{ .val = adc.light_level };
     abi.ipc_data.battery_level = adc.battery_level;
     terry.client.prepare_for_cart();
+    ext_flash.retryLate();
     abi.ipc_data.os_flags = .{
         .os_clear_supported = false, // TODO OS clear
         .ext_flash = ext_flash.present(),
     };
     abi.ipc_data.ext_flash_size = ext_flash.size();
     abi.ipc_data.ext_flash_cart_offset = ext_flash.cartAreaOffset();
+    abi.ipc_data.ext_flash_diag = ext_flash.bootDiag();
     abi.ipc_data.cart_dma_channels = board.cart_dma_mask;
 }
 

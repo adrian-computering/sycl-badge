@@ -177,10 +177,14 @@ pub fn init(config: InitConfig) !void {
 
     // 5. Initialize cart storage (FAT16 in romfs) before USB starts
     // This avoids USB timeouts while formatting flash on first boot.
-    // Detect the external flash on QMI CS1 first: once it is declared in the
-    // bootrom's FLASH_DEVINFO, connect_internal_flash keeps its chip select routed.
-    ext_flash.init();
     // Ensure internal flash is connected before any ROM access (improves persistence across power cycles)
+    // This also sets up the shared QSPI data pads, which the external chip
+    // needs (with QE clear, SD3 is its HOLD# input).
+    rom.connect_internal_flash();
+    // Then detect the external flash on QMI CS1. Once it is declared in the
+    // bootrom's FLASH_DEVINFO, connect_internal_flash keeps its chip select
+    // routed too, so connect again.
+    ext_flash.init();
     rom.connect_internal_flash();
     storage.init();
 

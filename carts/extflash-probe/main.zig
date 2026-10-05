@@ -250,7 +250,17 @@ fn draw() void {
             say(white, "cart area {d}KB @{X}", .{ area.len / 1024, a.len - area.len });
         } else {
             say(red, "not mapped by OS", .{});
-            say(grey, "(stock firmware?)", .{});
+        }
+        const d = cart.ext_flash_diag();
+        if (d >> 24 == 0xE2) {
+            const res: u8 = @truncate(d >> 8);
+            const names = [_][]const u8{ "ok", "no SFDP sig", "not JEDEC", "bad density" };
+            say(white, "boot check: {s}", .{if (res < names.len) names[res] else "?"});
+            say(white, "tries {d} byte0 {X:0>2}", .{ (d >> 16) & 0x7F, d & 0xFF });
+            if ((d >> 16) & 0x80 != 0) say(yellow, "found late (cart start)", .{});
+        } else {
+            say(red, "OS has no ext-flash", .{});
+            say(grey, "support (stock OS)", .{});
         }
         line_y += 4;
         const t = &write_test;

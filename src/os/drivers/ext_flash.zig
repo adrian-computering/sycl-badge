@@ -26,6 +26,7 @@ const std = @import("std");
 const microzig = @import("microzig");
 const hal = microzig.hal;
 const rom = @import("rom.zig");
+const timer = @import("timer.zig");
 const log = std.log.scoped(.ext_flash);
 
 const interrupt = microzig.interrupt;
@@ -86,6 +87,22 @@ pub const Info = struct {
 
 var info: ?Info = null;
 
+/// Boot detection outcome for carts (ipc ext_flash_diag), so a probe can tell
+/// this firmware from stock even when the chip check fails:
+/// magic 0xE2 << 24 | attempts << 16 | DetectResult << 8 | first SFDP byte seen.
+pub const diag_magic: u32 = 0xE2;
+pub const DetectResult = enum(u8) { ok = 0, no_signature = 1, not_jedec = 2, bad_density = 3 };
+var diag: u32 = 0;
+
+pub fn bootDiag() u32 {
+    return diag;
+}
+
+/// Detection attempts at boot, each preceded by a release-from-power-down
+/// (ABh) read, in case the chip is not ready yet right after power-up.
+const detect_attempts: u32 = 10;
+const detect_retry_ms: u32 = 5;
+
 /// Size in bytes, or 0 when no chip was found.
 pub fn size() u32 {
     return if (info) |i| i.size else 0;
@@ -122,9 +139,29 @@ fn setWindow1(timing: u32, rfmt: u32, cmd: u32) void {
     asm volatile ("dsb; isb" ::: .{ .memory = true });
 }
 
-/// Detect the chip and enable it. Call on core 0 before core 1 starts and
-/// before rom.connect_internal_flash() (which then keeps GPIO0 on XIP_CS1).
+/// Detect the chip and enable it. Call on core 0 before core 1 starts, after
+/// rom.connect_internal_flash() (QSPI pads) and before calling it again
+/// (which then keeps GPIO0 on XIP_CS1).
 pub fn init() void {
+    bringUp(detect_attempts);
+}
+
+/// One more detection attempt when a cart starts, if boot didn't find the
+/// chip: carts then get it, but the second USB drive only appears after a
+/// reboot. Marks the diag word with late_flag. Call on core 0 while no cart
+/// runs.
+pub fn retryLate() void {
+    if (info != null) return;
+    const boot_diag = diag;
+    bringUp(1);
+    // Keep the boot report unless this attempt worked.
+    diag = if (info != null) diag | (late_flag << 16) else boot_diag;
+}
+
+/// Set in the attempts byte of the diag word when retryLate() found the chip.
+pub const late_flag: u32 = 0x80;
+
+fn bringUp(attempts: u32) void {
     const saved_ctrl = reg(IO_BANK0_GPIO_CTRL).*;
     const saved_pad = reg(PADS_BANK0_GPIO).*;
     const saved_timing = reg(M1_TIMING).*;
@@ -136,7 +173,20 @@ pub fn init() void {
     reg(IO_BANK0_GPIO_CTRL).* = FUNC_XIP_CS1;
     reg(PADS_BANK0_GPIO).* = PADS_GPIO_RESET & ~PADS_ISO;
 
-    if (detect()) |found| {
+    var result: DetectResult = .no_signature;
+    var first_byte: u8 = 0;
+    var found_info: ?Info = null;
+    var attempt: u32 = 0;
+    while (attempt < attempts) {
+        if (attempt != 0) timer.sleep_ms(detect_retry_ms);
+        attempt += 1;
+        wake();
+        found_info = detect(&result, &first_byte);
+        if (found_info != null) break;
+    }
+    diag = (diag_magic << 24) | (attempt << 16) | (@as(u32, @intFromEnum(result)) << 8) | first_byte;
+
+    if (found_info) |found| {
         info = found;
         setDevinfo(found.size);
         applyReadMode();
@@ -147,18 +197,31 @@ pub fn init() void {
         setWindow1(saved_timing, saved_rfmt, saved_rcmd);
         reg(IO_BANK0_GPIO_CTRL).* = saved_ctrl;
         reg(PADS_BANK0_GPIO).* = saved_pad;
-        log.info("external flash: not found", .{});
+        log.info("external flash: not found (result {d}, first byte 0x{X:0>2})", .{ @intFromEnum(result), first_byte });
     }
 }
 
-fn detect() ?Info {
+/// ABh (release from deep power-down): command, three dummy bytes in the
+/// address phase, then the chip clocks out its electronic ID. Harmless when
+/// the chip is already awake; tRES1 is a few microseconds.
+fn wake() void {
+    setWindow1(DETECT_TIMING, RFMT_PREFIX_LEN_8, 0xAB);
+    var id: [1]u8 = undefined;
+    readNoCache(0, &id);
+    timer.sleep_us(50);
+}
+
+fn detect(result: *DetectResult, first_byte: *u8) ?Info {
     // 5Ah SFDP: 24-bit address, 8 dummy clocks.
     setWindow1(DETECT_TIMING, RFMT_PREFIX_LEN_8 | RFMT_DUMMY_LEN_8, 0x5A);
     var header: [16]u8 = undefined;
     readNoCache(0, &header);
+    first_byte.* = header[0];
+    result.* = .no_signature;
     if (!std.mem.eql(u8, header[0..4], "SFDP")) return null;
 
     // Parameter header 0 must be the JEDEC basic flash parameter table (ID 0xFF00).
+    result.* = .not_jedec;
     if (header[8] != 0x00 or header[15] != 0xFF) return null;
     const table: u32 = @as(u32, header[12]) | (@as(u32, header[13]) << 8) | (@as(u32, header[14]) << 16);
     var dw2: [4]u8 = undefined;
@@ -173,6 +236,7 @@ fn detect() ?Info {
     // FLASH_DEVINFO encodes 8 KB .. 16 MB as log2(size / 4 KB); window 1 is 16 MB.
     if (chip_bytes < 8 * 1024 or chip_bytes > 16 * 1024 * 1024 or !std.math.isPowerOfTwo(chip_bytes)) {
         log.warn("external flash: SFDP density 0x{X:0>8} unusable", .{density});
+        result.* = .bad_density;
         return null;
     }
 
@@ -181,6 +245,7 @@ fn detect() ?Info {
     var id: [2]u8 = undefined;
     readNoCache(0, &id);
 
+    result.* = .ok;
     return .{
         .size = @intCast(chip_bytes),
         .manufacturer = id[0],

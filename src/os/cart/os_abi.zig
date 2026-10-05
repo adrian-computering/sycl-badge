@@ -83,7 +83,7 @@ pub const CartIPCData = extern struct {
     app_time: u32,                     // x150F0..x150F4
     ext_flash_size: u32 = 0,           // x150F4..x150F8, bytes at ext_flash_base when os_flags.ext_flash
     ext_flash_cart_offset: u32 = 0,    // x150F8..x150FC, start of the cart-writable area (to ext_flash_size)
-    _reserved: [1]u32 = @splat(0),     // x150FC..x15100
+    ext_flash_diag: u32 = 0,           // x150FC..x15100, boot detection result (0 = OS without ext-flash support)
 
     comptime {
         // badge_cart.ld reserves 0x15100 bytes for IPC data.

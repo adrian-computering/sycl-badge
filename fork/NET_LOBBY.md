@@ -92,9 +92,16 @@ as it is. Networking lives entirely in the `badge` host tool.
 
 ## Status
 
-- 2026-10-05: plan written; tailcat verified on the VM. N0/N1 net.py and
-  tests start now with fakes. Wiring into `lobby.py` waits for the cart-serial
-  host track (exedev-94 messages exedev-06 when it lands).
+- 2026-10-05: plan written; tailcat verified on the VM.
+- 2026-10-05: `tools/badge/badge/net.py` (Listener, Joiner, Tailcat,
+  `join_command`, `start_hub_tailcat`) and `tools/badge/tests/test_net.py`
+  are done. 14 unit tests with fake hub, ports and tailcat; 15/15 clean runs.
+  The opt-in `BADGE_TEST_TAILCAT=1` test passes over real tailcat v0.7.0 (two
+  joined endpoints, both directions, path "direct via 10.42.0.42, 5.8ms").
+  Left for N0/N1: wiring `--listen` / `--tailcat` into `lobby.py` (a link
+  source fed by `Listener.accept`) and `badge join` into the CLI with real
+  discovery/SerialLink. That waits for the cart-serial host track (exedev-94
+  messages exedev-06 when M1-C lands). N2 follows.
 
 ## Deferred questions (defaults taken)
 

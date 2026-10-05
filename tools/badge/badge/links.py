@@ -36,6 +36,7 @@ import os
 import select
 import socket
 import threading
+import time
 from typing import Optional, Tuple
 
 
@@ -325,8 +326,28 @@ def open_link(url: str, key: str = "", label: str = "", timeout: float = 1.0) ->
     """Open a serial device path or a socket://host:port / tcp://host:port URL."""
     tcp = parse_tcp_url(url)
     if tcp is not None:
-        try:
-            return SocketLink.connect(tcp[0], tcp[1], key=key or url, label=label or url, timeout=timeout)
-        except OSError as e:
-            raise LinkClosed(str(e))
+        # A simulator serves one client and resets any other. Right after a
+        # discovery probe it may not have noticed the probe leave yet, so a
+        # connection that is reset at once is retried a few times.
+        for attempt in range(5):
+            try:
+                link = SocketLink.connect(tcp[0], tcp[1], key=key or url, label=label or url, timeout=timeout)
+            except OSError as e:
+                raise LinkClosed(str(e))
+            if not _reset_at_once(link.sock):
+                return link
+            link.close()
+            time.sleep(0.1 * (attempt + 1))
+        raise LinkClosed("%s is busy (another program has it open?)" % url)
     return SerialLink(url, key=key or url, label=label or url)
+
+
+def _reset_at_once(sock: socket.socket, wait: float = 0.05) -> bool:
+    """True when the peer closes or resets a fresh connection within `wait`."""
+    try:
+        ready, _, _ = select.select([sock], [], [], wait)
+        if not ready:
+            return False
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except OSError:
+        return True

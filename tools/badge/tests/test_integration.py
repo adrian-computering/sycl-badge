@@ -154,6 +154,49 @@ class TcpOverflowTest(unittest.TestCase):
         self.assertTrue(any("not reading" in l for l in logs), logs)
 
 
+    def test_quiet_stalled_socket_player_removed(self):
+        """A low-traffic peer that stops reading is dropped after dead_time.
+
+        The OS default socket buffers would absorb tens of KB first, which a
+        quiet game takes minutes to fill; the relay must not wait for that.
+        """
+        import socket
+
+        from badge.links import SocketLink
+
+        logs = []
+        server = LobbyServer(Lobby(log=logs.append), log=logs.append, stats_interval=0, dead_time=0.5)
+        a = FakeCart(game="G", name="a")
+        self.addCleanup(a.close)
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        self.addCleanup(srv.close)
+        server.add_source(SimSource([(a.host, a.port)], interval=0.1))
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.stop)
+        sock = socket.socket()
+        sock.connect(srv.getsockname())
+        stalled, _ = srv.accept()
+        self.addCleanup(stalled.close)
+        stalled.sendall(frames.encode(frames.Hello(game="G", name="stall").pack()))
+        server.add_link(SocketLink(sock, key="stall", label="stall"))  # sets the small SO_SNDBUF
+        a.wait_for(lambda m: last_roster(m) is not None and len(last_roster(m)) == 2)
+        # about 8 KB/s, below a 16 x 60 Hz game: fills the kernel buffers in a
+        # few seconds, never the 64 KB queue limit
+        start = time.time()
+        while time.time() - start < 20:
+            a.send(0xFF, b"q" * 40)
+            time.sleep(0.005)
+            if len(last_roster(a.msgs)) == 1:
+                break
+        self.assertEqual(len(last_roster(a.msgs)), 1, "quiet stalled player was not removed")
+        self.assertLess(time.time() - start, 10)
+        self.assertTrue(any("not reading" in l for l in logs), logs)
+
 class CliLobbyTest(unittest.TestCase):
     def test_cli_lobby_runs_and_stops_cleanly(self):
         a = FakeCart(game="CLI", name="a")

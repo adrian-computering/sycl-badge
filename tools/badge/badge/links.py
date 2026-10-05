@@ -31,6 +31,7 @@ network lobby). open_link(url) picks one.
 
 from __future__ import annotations
 
+import errno
 import os
 import select
 import socket
@@ -71,6 +72,12 @@ class Link:
         return "<%s %s>" % (type(self).__name__, self.key or self.label)
 
 
+# Lobby traffic is small (16 players x 60 Hz is about 10 KB/s per link), so a
+# 4 KB send buffer (Linux doubles it) does not limit throughput, even over a
+# tunnel with 100 ms round trips.
+SOCKET_SNDBUF = 4 * 1024
+
+
 class SocketLink(Link):
     """A connected stream socket. Reads use select, writes block."""
 
@@ -84,6 +91,13 @@ class SocketLink(Link):
         sock.setblocking(True)
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        try:
+            # A small kernel buffer, so a peer that stops reading shows up as
+            # a stuck write within a few KB instead of after the OS default
+            # (often 45 KB+), and the relay's stall rules can see it.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_SNDBUF)
         except OSError:
             pass
 
@@ -190,9 +204,20 @@ class SerialLink(Link):
         try:
             port = serial.Serial(**kwargs)
             port.port = device
-            port.dtr = True
+            # Open with DTR low, then raise it. pyserial flushes the input
+            # buffer inside open(), after setting the lines; a cart that
+            # answers DTR with HELLO right away would lose it. The firmware
+            # discards cart output while DTR is low, so nothing stale waits.
+            port.dtr = False
             port.rts = True
             port.open()
+            try:
+                port.dtr = True
+            except OSError as e:
+                # ptys and some adapters have no modem lines; open() ignores
+                # the same errors.
+                if e.errno not in (errno.EINVAL, errno.ENOTTY):
+                    raise
         except (serial.SerialException, OSError, ValueError) as e:
             raise LinkClosed(str(e))
         self.port = port

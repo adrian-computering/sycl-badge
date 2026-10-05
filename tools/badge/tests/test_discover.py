@@ -330,10 +330,6 @@ class SelectTest(unittest.TestCase):
         self.assertEqual(b.cart, "socket://127.0.0.1:%d" % p)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ExtFlashDriveTests(unittest.TestCase):
     """Ext-flash firmware (fork/EXT_FLASH.md) adds LUN 1, the SYCLEXTRA drive."""
 
@@ -366,3 +362,7 @@ class ExtFlashDriveTests(unittest.TestCase):
         (b,) = s.badges
         self.assertEqual(b.drive, "/Volumes/SYCLBADGE")
         self.assertEqual(s.loose_drives, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -238,6 +238,30 @@ pub fn loadUF2Cart(name: []const u8) LoadError!mailbox.MessageType.CartExecute {
     const cart_info = storage.findCart(name) orelse {
         return LoadError.FileNotFound;
     };
+    return loadUF2CartInfo(cart_info);
+}
+
+/// Load a cart the menu listed, by its exact location (names can repeat
+/// across the two drives).
+pub fn loadUF2CartEntry(entry: storage.CartEntry) LoadError!mailbox.MessageType.CartExecute {
+    if (cart_state.state == .running) {
+        multicore.haltCore1();
+        multicore.resetCore1();
+    }
+    cart_state.set_state(.loading, @src());
+    errdefer cart_state.set_state(.error_state, @src());
+    return loadUF2CartInfo(.{
+        .volume = entry.volume,
+        .start_cluster = entry.start_cluster,
+        .size = entry.size,
+        .short_name = @splat(0),
+        .long_name = undefined,
+        .long_name_len = 0,
+    });
+}
+
+fn loadUF2CartInfo(cart_info: storage.CartInfo) LoadError!mailbox.MessageType.CartExecute {
+    errdefer cart_state.set_state(.error_state, @src());
 
     // Validate size (UF2 blocks are 512 bytes each, cart_xip is 256KB)
     // Max useful data per block is 256 bytes, so max UF2 file size is roughly 2x cart_xip size

@@ -58,8 +58,11 @@ ID (90h), 03h data and a 64 KB speed test through window 1. Hardware result pend
   same FAT12 layout as the main drive, so drive-ROM readers only need the base.
 - Cart requests are one 4 KB sector each (core 0 runs them in its main loop, where
   USB is polled); the cart API loops.
-- Volume = chip minus the 256 KB cart area = 1792 KB, 128 root entries, formatted on
-  first boot with the chip. Duplicate cart names: the main drive's copy wins.
+- Volume = fixed 1792 KB (chip minus the 256 KB cart area), 128 root entries,
+  formatted on first boot with the chip. Menu rows remember (drive, cluster), so
+  repeated names launch the right file; only *.uf2 files from the extra drive are listed.
+- Known, not fixed: a command for a LUN the host never asked about gets a failed CSW
+  without stalling the data phase (same as the existing unhandled-opcode path).
 
 ### E3 — later / deferred
 - Quad reads (QE bit via direct mode at boot) if the 0Bh speed is not enough.

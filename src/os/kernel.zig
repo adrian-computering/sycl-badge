@@ -105,6 +105,7 @@ const MAX_CARTS: usize = 64;
 const MAX_CART_NAME_LEN: usize = 64;
 var cart_names: [MAX_CARTS][MAX_CART_NAME_LEN]u8 = undefined;
 var cart_name_lengths: [MAX_CARTS]usize = undefined;
+var cart_entries: [MAX_CARTS]storage.CartEntry = undefined;
 var collect_index: usize = 0;
 var cart_list_truncated: bool = false;
 
@@ -686,6 +687,7 @@ fn collectCartName(name: []const u8, size: u32) void {
     const copy_len = @min(name.len, MAX_CART_NAME_LEN - 1);
     @memcpy(cart_names[collect_index][0..copy_len], name[0..copy_len]);
     cart_name_lengths[collect_index] = copy_len;
+    cart_entries[collect_index] = storage.visitingCart();
     collect_index += 1;
 }
 
@@ -718,7 +720,7 @@ fn runSelectedCart() void {
 
     // Load the cart
     console.println("[BTN] calling loadUF2Cart...");
-    const entry_point = loader.loadUF2Cart(name) catch |err| {
+    const entry_point = loader.loadUF2CartEntry(cart_entries[cursor_index]) catch |err| {
         // Show error on LCD
         lcd.fillRect(0, 50, lcd.width, 70, .black);
         const error_msg = switch (err) {

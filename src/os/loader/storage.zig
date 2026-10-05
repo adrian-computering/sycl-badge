@@ -24,6 +24,8 @@ const VOLUME_START_LBA: u32 = 0; // Super-floppy layout (boot sector at LBA0)
 const NUM_FATS: u8 = 2;
 const SECTORS_PER_CLUSTER: u8 = 1; // 512B clusters for FAT12
 const MEDIA_DESCRIPTOR: u8 = 0xF8;
+/// FAT12 entries 0xFF8..0xFFF mark the end of a cluster chain.
+const FAT12_EOC_MIN: u16 = 0xFF8;
 
 /// One FAT12 volume in memory-mapped flash. Sectors are read straight from
 /// the XIP window and written through the bootrom (flash offset = base - XIP_BASE,
@@ -40,8 +42,10 @@ pub const Volume = struct {
 const ROMFS_ROOT_ENTRIES: u16 = 32; // Small root directory for 1.5MB volume
 /// External volume: room for more files (long names take 2-3 entries each).
 const EXT_ROOT_ENTRIES: u16 = 128;
-/// FAT12 tops out at 4084 clusters; with 512 B clusters cap the volume below that.
-const EXT_MAX_VOLUME_SECTORS: u32 = 4000;
+/// Fixed size, so a change elsewhere (cart area, a bigger chip) never makes
+/// isSizeCorrect() reformat the drive and lose its files. 3584 sectors =
+/// 3553 clusters, under FAT12's 4085 limit with 512 B clusters.
+const EXT_VOLUME_SIZE: u32 = 1792 * 1024;
 
 var volumes: [2]Volume = undefined;
 var volume_count: u8 = 0;
@@ -53,6 +57,20 @@ pub fn volumeCount() u8 {
 /// Volume by USB LUN / CartInfo.volume index. Out-of-range indices get the main volume.
 pub fn volume(index: u8) *const Volume {
     return &volumes[if (index < volume_count) index else 0];
+}
+
+/// Where a listed cart lives; valid inside a listCarts() callback via visitingCart().
+pub const CartEntry = struct {
+    volume: u8,
+    start_cluster: u16,
+    size: u32,
+};
+var visiting: CartEntry = .{ .volume = 0, .start_cluster = 0, .size = 0 };
+
+/// The cart the current listCarts() callback is being called for. Lets
+/// callers remember exactly which file a row is, even if names repeat.
+pub fn visitingCart() CartEntry {
+    return visiting;
 }
 
 pub const CartInfo = struct {
@@ -106,12 +124,11 @@ pub fn init() void {
         .serial = 0x20260120,
     };
     volume_count = 1;
-    if (ext_flash.present()) {
-        // The end of the chip is the cart-writable area; the volume gets the rest.
-        const avail = ext_flash.cartAreaOffset() & ~@as(u32, FLASH_ERASE_BLOCK - 1);
+    // The end of the chip is the cart-writable area; the volume sits below it.
+    if (ext_flash.present() and ext_flash.cartAreaOffset() >= EXT_VOLUME_SIZE) {
         volumes[1] = .{
             .base = ext_flash.base,
-            .size = @min(avail, EXT_MAX_VOLUME_SECTORS * SECTOR_SIZE),
+            .size = EXT_VOLUME_SIZE,
             .root_entries = EXT_ROOT_ENTRIES,
             .label = "SYCLEXTRA  ",
             .serial = 0x20261005,
@@ -163,13 +180,12 @@ fn wipeVolume(v: *const Volume) void {
     const erase_len = (size + (FLASH_ERASE_BLOCK - 1)) & ~@as(usize, FLASH_ERASE_BLOCK - 1);
     const flash_offset = base - XIP_BASE;
 
-    const cs = interrupt.enter_critical_section();
-    defer cs.leave();
-
-    rom.flash_exit_xip();
-    rom.flash_range_erase(flash_offset, erase_len, FLASH_ERASE_BLOCK, FLASH_ERASE_CMD);
-    rom.flash_flush_cache();
-    rom.flash_enter_cmd_xip();
+    // One erase block per critical section, so a 1.8 MB volume doesn't keep
+    // interrupts off for tens of seconds.
+    var done: usize = 0;
+    while (done < erase_len) : (done += FLASH_ERASE_BLOCK) {
+        eraseBlock(@intCast(flash_offset + done));
+    }
 
     pending_valid = false;
     pending_dirty = false;
@@ -477,6 +493,16 @@ pub fn romfsSizeBytes() usize {
     return volumes[0].size;
 }
 
+noinline fn eraseBlock(flash_offset: u32) linksection(".ram_text") void {
+    const cs = interrupt.enter_critical_section();
+    defer cs.leave();
+
+    rom.flash_exit_xip();
+    rom.flash_range_erase(flash_offset, FLASH_ERASE_BLOCK, FLASH_ERASE_BLOCK, FLASH_ERASE_CMD);
+    rom.flash_flush_cache();
+    rom.flash_enter_cmd_xip();
+}
+
 fn flushPending() linksection(".ram_text") void {
     if (!pending_valid) {
         return; // Silent (no pending data)
@@ -501,10 +527,10 @@ fn flushPending() linksection(".ram_text") void {
 
 /// Visit every cart on every volume (main volume first).
 pub fn listCarts(callback: *const fn (name: []const u8, size: u32) void) void {
-    for (volumes[0..volume_count]) |*v| listCartsIn(v, callback);
+    for (volumes[0..volume_count], 0..) |*v, index| listCartsIn(v, @intCast(index), callback);
 }
 
-fn listCartsIn(v: *const Volume, callback: *const fn (name: []const u8, size: u32) void) void {
+fn listCartsIn(v: *const Volume, index: u8, callback: *const fn (name: []const u8, size: u32) void) void {
     var sector_buf = &sector_bufs[0];
     var prev_sector_buf = &sector_bufs[1];
     const root_start = rootStartLba(v);
@@ -545,7 +571,11 @@ fn listCartsIn(v: *const Volume, callback: *const fn (name: []const u8, size: u3
             else
                 formatShortName(entry, &name_buf);
 
+            // The extra drive is meant for ROMs and data too; only its carts go in the menu.
+            if (index > 0 and !std.ascii.endsWithIgnoreCase(display_name, ".uf2")) continue;
+
             const size = readU32(entry, DIR_FILE_SIZE);
+            visiting = .{ .volume = index, .start_cluster = readU16(entry, DIR_FIRST_CLUSTER), .size = size };
             callback(display_name, size);
         }
     }
@@ -601,7 +631,7 @@ fn countCartsIn(v: *const Volume, index: u8, first_cart: ?*CartInfo) u32 {
 
             // If caller wants first cart info and we haven't found it yet
             if (first_cart != null and !found_first) {
-                const lfn_len = readLfnEntriesMultiSector(if (lba > root_start) &prev_sector_buf else null, sector_buf[0..], i, lfn_buf[0..]);
+                const lfn_len = readLfnEntriesMultiSector(if (lba > root_start) prev_sector_buf else null, sector_buf[0..], i, lfn_buf[0..]);
 
                 _ = formatShortName(entry, &name_buf);
 
@@ -846,7 +876,7 @@ pub const FileIterator = struct {
             it.sector_index = 0;
         }
 
-        if (it.cluster < 2 or it.cluster >= 0xFFF8) {
+        if (it.cluster < 2 or it.cluster >= FAT12_EOC_MIN) {
             it.bytes_left = 0;
             return null;
         }
@@ -870,7 +900,7 @@ pub fn readCart(cart: CartInfo, dst: []u8) u32 {
     var dst_offset: usize = 0;
     const sector_buf = &sector_bufs[0];
 
-    while (cluster >= 2 and cluster < 0xFFF8 and bytes_left > 0) {
+    while (cluster >= 2 and cluster < FAT12_EOC_MIN and bytes_left > 0) {
         var sector_index: u8 = 0;
         while (sector_index < SECTORS_PER_CLUSTER and bytes_left > 0) : (sector_index += 1) {
             const lba = clusterToLba(v, cluster) + sector_index;
@@ -951,7 +981,7 @@ fn setFatEntry(v: *const Volume, cluster: u16, value: u16, sector_buf: *[SECTOR_
 
 fn clearFatChain(v: *const Volume, start: u16, sector_buf_a: *[SECTOR_SIZE]u8, sector_buf_b: *[SECTOR_SIZE]u8) void {
     var cluster = start;
-    while (cluster >= 2 and cluster < 0xFFF8) {
+    while (cluster >= 2 and cluster < FAT12_EOC_MIN) {
         const next = fatEntry(v, cluster, sector_buf_a, sector_buf_b);
         setFatEntry(v, cluster, 0, sector_buf_a, sector_buf_b);
         cluster = next;

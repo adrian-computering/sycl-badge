@@ -16,6 +16,7 @@ FEATURES=(
 )
 IN_PROGRESS=(
   feature/cart-serial:feature/usb-console
+  feature/net-lobby:feature/cart-serial
 )
 
 ZIG="${ZIG:-zig}"

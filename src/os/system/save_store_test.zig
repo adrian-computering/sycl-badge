@@ -236,7 +236,7 @@ fn expectAll(st: *ss.Store, kvs: []const KV) !void {
 // ---------------------------------------------------------------------------------------
 
 test "Store fits the kernel RAM budget" {
-    std.debug.print("save_store: @sizeOf(Store) = {d} bytes\n", .{@sizeOf(ss.Store)});
+    std.log.info("save_store: @sizeOf(Store) = {d} bytes", .{@sizeOf(ss.Store)});
     try expect(@sizeOf(ss.Store) <= 10 * 1024);
 }
 
@@ -702,7 +702,7 @@ test "flash op counts for 1 KB and 32 KB writes" {
         var steps: u32 = 0;
         while (st.step() == .more) steps += 1;
         steps += 1;
-        std.debug.print("save_store: {d} B write = {d} steps, {d} erase4k, {d} page programs, {d} reads\n", .{ n, steps, sim.n_erase, sim.n_program, sim.n_read });
+        std.log.info("save_store: {d} B write = {d} steps, {d} erase4k, {d} page programs, {d} reads", .{ n, steps, sim.n_erase, sim.n_program, sim.n_read });
         try expectEqual(we, sim.n_erase);
         try expectEqual(wp, sim.n_program);
         try expectEqual(2 * (we - 1) + 2, steps);
@@ -734,7 +734,7 @@ test "wear: next-fit spreads erases over the data blocks" {
         lo = @min(lo, c);
         hi = @max(hi, c);
     }
-    std.debug.print("save_store: wear after 1000 x 1 KB writes: data blocks max {d} min {d} (static-key blocks {d}), dir A {d} dir B {d}\n", .{ hi, lo, lo_all, sim.erase_count[0], sim.erase_count[1] });
+    std.log.info("save_store: wear after 1000 x 1 KB writes: data blocks max {d} min {d} (static-key blocks {d}), dir A {d} dir B {d}", .{ hi, lo, lo_all, sim.erase_count[0], sim.erase_count[1] });
     try expect(hi - lo <= 1);
     try expect(hi <= 18);
     try expect(sim.erase_count[0] + sim.erase_count[1] == 1002);

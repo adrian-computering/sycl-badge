@@ -133,6 +133,43 @@ pub fn audio_submit_samples(num: usize) void {
 
 // ┌───────────────────────────────────────────────────────────────────────────┐
 // │                                                                           │
+// │ Serial Functions (see serial.zig)                                         │
+// │                                                                           │
+// └───────────────────────────────────────────────────────────────────────────┘
+
+// M0 interface stubs: the port reports unsupported until M1 lands.
+pub fn serial_supported() bool {
+    return false;
+}
+pub fn serial_open(rx: []u8, tx: []u8) error{Unsupported}!void {
+    _ = rx;
+    _ = tx;
+    return error.Unsupported;
+}
+pub fn serial_close() void {}
+pub fn serial_is_open() bool {
+    return false;
+}
+pub fn serial_connected() bool {
+    return false;
+}
+pub fn serial_write(bytes: []const u8) usize {
+    _ = bytes;
+    return 0;
+}
+pub fn serial_read(buf: []u8) usize {
+    _ = buf;
+    return 0;
+}
+pub fn serial_bytes_available() usize {
+    return 0;
+}
+pub fn serial_space_available() usize {
+    return 0;
+}
+
+// ┌───────────────────────────────────────────────────────────────────────────┐
+// │                                                                           │
 // │ Other Functions                                                           │
 // │                                                                           │
 // └───────────────────────────────────────────────────────────────────────────┘

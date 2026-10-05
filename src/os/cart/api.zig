@@ -867,6 +867,17 @@ pub inline fn write_flash_page(page: u16, src: [flash_page_size]u8) void {
 
 // ┌───────────────────────────────────────────────────────────────────────────┐
 // │                                                                           │
+// │ Serial and Multiplayer (fork firmware, see fork/CART_SERIAL.md)           │
+// │                                                                           │
+// └───────────────────────────────────────────────────────────────────────────┘
+
+/// Byte pipe to a program on the host computer over USB (or TCP in the simulator).
+pub const serial = @import("serial.zig");
+/// Message framing and a multiplayer lobby client built on `serial`.
+pub const lobby = @import("lobby.zig");
+
+// ┌───────────────────────────────────────────────────────────────────────────┐
+// │                                                                           │
 // │ Profiling Functions                                                       │
 // │                                                                           │
 // └───────────────────────────────────────────────────────────────────────────┘

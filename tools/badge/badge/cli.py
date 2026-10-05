@@ -151,6 +151,25 @@ def cmd_monitor(args) -> int:
     return monitor.run(link, mode=mode, eol=args.eol)
 
 
+def cmd_echo_test(args) -> int:
+    from . import echotest
+    from .links import LinkClosed, open_link
+
+    if args.port:
+        url = args.port
+    else:
+        s = do_scan(args, drives=False, probe=True)
+        url = pick_one(s.badges, args.badge, "cart").cart
+    try:
+        link = open_link(url)
+    except LinkClosed as e:
+        die("cannot open %s: %s" % (url, e))
+    try:
+        return echotest.run(link, rate=args.rate, size=args.size, seconds=args.seconds)
+    finally:
+        link.close()
+
+
 # ---------------------------------------------------------------------------
 # badge flash
 
@@ -348,6 +367,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--port", help="device path or socket://host:port to open")
     sp.add_argument("--sim", metavar="PORTS", help="simulator ports to probe (default 7341-7356)")
     sp.set_defaults(func=cmd_monitor)
+
+    sp = sub.add_parser("echo-test", help="time cart serial round trips (run the serial-echo cart)")
+    sp.add_argument("badge", nargs="?", help="badge id, serial, sim:PORT or port")
+    sp.add_argument("--rate", type=float, default=60.0, help="records per second (default 60)")
+    sp.add_argument("--size", type=int, default=16, help="bytes per record, at least 13 (default 16)")
+    sp.add_argument("--seconds", type=float, default=10.0, help="how long to send (default 10)")
+    sp.add_argument("--port", help="device path or socket://host:port to open")
+    sp.add_argument("--sim", metavar="PORTS", help="simulator ports to probe (default 7341-7356)")
+    sp.set_defaults(func=cmd_echo_test)
 
     sp = sub.add_parser("flash", help="flash OS firmware onto badges")
     sp.add_argument("firmware", help="firmware UF2 (zig-out/firmware/sycl-os-kernel.uf2)")

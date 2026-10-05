@@ -10,9 +10,11 @@
 //! stdout once it listens.
 //!
 //! One client at a time: while a client is connected, further connections are
-//! accepted and closed immediately (refused), so a tool that probes the port
-//! never kicks out the program that is using it. A client that sees the
-//! connection close right away knows the simulator is busy.
+//! accepted and closed immediately with a reset (refused), so a tool that
+//! probes the port never kicks out the program that is using it. A client
+//! whose connection is reset (or closed) right away knows the simulator is
+//! busy. The simulator always closes with a reset, never a FIN, so its port
+//! never lingers in TIME_WAIT and a restarted simulator gets the same port.
 //!
 //! Semantics match the badge: `connected()` is true while a client is
 //! connected; bytes the cart writes with no client connected are discarded;
@@ -134,6 +136,8 @@ fn accept_loop() Io.Cancelable!void {
                 continue;
             },
         };
+        // Every close from our side resets, so the port never sits in
+        // TIME_WAIT (a refused client sees a reset instead of an EOF).
         set_abortive_close(stream);
 
         try mutex.lock(io);

@@ -16,6 +16,7 @@ const rev = @import("drivers/rev.zig");
 const rtt = @import("drivers/rtt.zig");
 const neopixel = @import("drivers/neopixel.zig");
 const console = @import("system/console.zig");
+const cart_serial = @import("system/cart_serial.zig");
 const settings = @import("system/settings.zig");
 const init = @import("system/init.zig");
 const fps_overlay = @import("system/fps_overlay.zig");
@@ -140,6 +141,7 @@ pub noinline fn main() !void {
     });
 
     screen_wait_for.register("kernel.screen_wait_for", .cart, @src());
+    cart_serial.init();
 
     last_buttons = read_buttons();
 
@@ -157,6 +159,7 @@ pub noinline fn main() !void {
     while (true) {
         // Poll USB frequently for console
         usb.poll();
+        cart_serial.poll();
 
         audio.poll();
 
@@ -753,6 +756,7 @@ fn init_cart_ipc_data() void {
     terry.client.prepare_for_cart();
     abi.ipc_data.os_flags = .{
         .os_clear_supported = false, // TODO OS clear
+        .cart_serial_supported = true,
     };
     abi.ipc_data.cart_dma_channels = board.cart_dma_mask;
 }

@@ -150,7 +150,7 @@ Cart to host:
 | Type | Name | Payload |
 |---|---|---|
 | `0x01` | HELLO | `version: u8 = 1`, `game: [8]u8`, `name: [12]u8`, `max_players: u8` (2-16, 0 = host default) |
-| `0x02` | SEND | `to: u8` (player id, or `0xFF` = everyone else in the room), `data` (0-240 bytes) |
+| `0x02` | SEND | `to: u8` (player id; `0xFF` = everyone else in the room; `0xFE` = everyone including the sender), `data` (0-240 bytes) |
 | `0x03` | PING | `token: u32` |
 | `0x04` | LEAVE | (none) |
 
@@ -181,9 +181,23 @@ Error codes: 1 unsupported version, 2 no room (server full), 3 not joined
   fixed while the player is connected.
 - The host sends WELCOME to the new player, then ROSTER to everyone in the
   room, after every join and leave.
-- SEND is relayed as DATA to the addressed player, or to every other player in
-  the room for `0xFF`, in the order received. The host never invents game
-  data; games decide who is authoritative (for example, the lowest player id).
+- SEND is relayed as DATA to the addressed player, to every other player in
+  the room for `0xFF`, or to every player including the sender for `0xFE`
+  (self-echo: the sender gets `DATA(from = itself)` at its place in the room's
+  order, like a shared serial line where a console hears its own bytes). A
+  SEND to an id that is not in the room is dropped. The host never invents
+  game data; games decide who is authoritative (for example, the lowest
+  player id).
+- **One order per room.** The host handles a room's frames one at a time: a
+  frame is queued to every recipient before the next frame is looked at, so
+  all players see the room's DATA in the same global order (each player minus
+  its own frames, unless it used `0xFE`). The ROSTER that removes a player is
+  queued after every frame that player got to the host, so "the last input
+  anyone received from the leaver" is the same on every badge.
+- **No silent loss.** While a player is connected nothing addressed to it is
+  dropped. If a player stops reading and its outgoing queue overflows, the
+  host removes that player (ROSTER to the others, port closed) rather than
+  skipping frames.
 - A player leaves when it sends LEAVE or HELLO for another game, its port
   closes, or the badge disappears. The host closes the port of a badge it
   stops seeing.

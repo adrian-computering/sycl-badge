@@ -200,7 +200,12 @@ Error codes: 1 unsupported version, 2 no room (server full), 3 not joined
 - A cart sends HELLO when it opens the port and again whenever `connected()`
   goes from false to true (the lobby restarted, or the cable was replugged).
   A HELLO from a cart that is already in a room is a rejoin: it leaves the old
-  room first.
+  room first, exactly like a LEAVE. The other members always get the ROSTER
+  without the player before any ROSTER that has it again, so a rejoin is
+  visible as a leave plus a join even when the player gets the same room and
+  id back. (It can land in another room or get another id: placement is a
+  fresh join. If it was alone, the old room closes and a new one opens.) The
+  rejoining cart gets WELCOME, then the new room's ROSTER.
 - The host puts a new player in the first room with the same `game` that has a
   free slot, otherwise opens a new room. A room's size is the first member's
   `max_players` (capped at 16). Rooms with different `game` ids never mix, so

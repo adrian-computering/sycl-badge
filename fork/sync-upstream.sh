@@ -13,9 +13,9 @@ set -euo pipefail
 # but not merged into main until they move up to FEATURES.
 FEATURES=(
   feature/usb-console
+  feature/cart-serial:feature/usb-console
 )
 IN_PROGRESS=(
-  feature/cart-serial:feature/usb-console
   feature/net-lobby:feature/cart-serial
 )
 

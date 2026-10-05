@@ -47,3 +47,22 @@ pub inline fn flash_range_erase(addr: u32, count: usize, block_size: u32, block_
 pub inline fn flash_range_program(addr: u32, data: []const u8) void {
     rom_api.flash_range_program(addr, data);
 }
+
+// -----------------------------------------------------------------------------
+// Chip Information
+// -----------------------------------------------------------------------------
+
+/// The 64-bit chip id burned into OTP at manufacture (CHIPID0-3), unique per
+/// chip. Read through the bootrom's get_sys_info(SYS_INFO_CHIP_INFO), which
+/// returns the flags word, then package_sel, device_id and wafer_id. The value
+/// is wafer_id:device_id, the same 16 hex digits that picotool and the pico-sdk
+/// (pico_get_unique_board_id) report for the chip.
+/// Returns 0 if the bootrom call fails.
+pub fn chip_id() u64 {
+    const SYS_INFO_CHIP_INFO = 0x0001;
+    var info: [4]u32 = @splat(0);
+    const get_sys_info: *const rom_api.signatures.get_sys_info = @ptrCast(@alignCast(rom_api.lookup_function(.get_sys_info)));
+    // The number of words written: the flags word plus three
+    if (get_sys_info(&info, info.len, SYS_INFO_CHIP_INFO) != info.len) return 0;
+    return (@as(u64, info[3]) << 32) | info[2];
+}

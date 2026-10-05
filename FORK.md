@@ -11,7 +11,7 @@ fork features detect stock firmware at run time and degrade gracefully.
 | Feature | Branch | Status | Docs |
 |---|---|---|---|
 | USB serial console (restores the console and `cart.trace()` output over USB, lost in upstream #136) | `feature/usb-console` | merged | below |
-| Cart serial port and multiplayer lobby (`cart.serial`, `cart.lobby`, `badge lobby`) | `feature/cart-serial` | in progress | [fork/CART_SERIAL.md](fork/CART_SERIAL.md) |
+| Cart serial port and multiplayer lobby (`cart.serial`, `cart.lobby`, `badge lobby`) | `feature/cart-serial` | merged (untested on hardware) | [fork/CART_SERIAL.md](fork/CART_SERIAL.md) |
 | Network lobby (`badge lobby --listen/--tailcat`, `badge join`: badges on different laptops share a lobby over a LAN or the internet via [tailcat](https://github.com/tailscale/tailcat)) | `feature/net-lobby` (on `feature/cart-serial`) | in progress | [fork/NET_LOBBY.md](fork/NET_LOBBY.md) |
 
 The USB console comes from Carl Sverre's upstream PRs #159 and #160, merged
@@ -29,8 +29,9 @@ every plugged-in badge are one command:
 `badge flash zig-out/firmware/sycl-os-kernel.uf2 --all` (see `tools/badge`).
 
 The console is the "SYCL Badge Console" serial port: `/dev/ttyACM0` or
-`/dev/serial/by-id/*SYCL*-if01` on Linux, `/dev/cu.usbmodem*1` on macOS, a COM
-port on Windows. Open it with any terminal (`tio`, `screen`, PuTTY) or
+`/dev/serial/by-id/*SYCL*-if01` on Linux, one of the badge's two
+`/dev/cu.usbmodem*` ports on macOS, a COM port on Windows (`badge list` shows
+which). Open it with any terminal (`tio`, `screen`, PuTTY) or
 `badge console`, and type `help`.
 
 To go back to upstream firmware, flash an upstream build the same way.

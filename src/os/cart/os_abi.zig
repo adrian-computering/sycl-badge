@@ -73,13 +73,18 @@ pub const CartIPCData = extern struct {
     clear_color: DisplayColor,         // x150E8..x150EA
     os_flags: packed struct (u16) {    // x150EA..x150EC
         os_clear_supported: bool,
-        _reserved: u15 = 0,
+        /// Fork firmware: the OS serves `cart_serial` (see CartSerialRings).
+        cart_serial_supported: bool = false,
+        _reserved: u14 = 0,
     },
 
     cart_dma_channels: u16,            // x150EC..x150EE
     _pad6: u16 = 0,                    // x150EE..x150F0
     app_time: u32,                     // x150F0..x150F4
-    _reserved: [3]u32 = @splat(0),     // x150F0..x15100
+    /// Fork firmware: the cart's serial rings, null while the port is closed.
+    /// Written by the cart, cleared by the OS at cart start and stop.
+    cart_serial: ?*CartSerialRings,    // x150F4..x150F8
+    _reserved: [2]u32 = @splat(0),     // x150F8..x15100
 
     comptime {
         // badge_cart.ld reserves 0x15100 bytes for IPC data.
@@ -90,6 +95,49 @@ pub const CartIPCData = extern struct {
 // zig fmt: on
 
 pub const ipc_data: *align(0x2000) volatile CartIPCData = @ptrFromInt(base);
+
+// ┌───────────────────────────────────────────────────────────────────────────┐
+// │ Cart serial (fork firmware, see fork/CART_SERIAL.md)                      │
+// └───────────────────────────────────────────────────────────────────────────┘
+
+/// Two single-producer/single-consumer byte rings in cart RAM that connect the
+/// cart to the "SYCL Badge Cart Serial" USB port. The cart fills in the struct,
+/// then stores its address in `ipc_data.cart_serial`; storing null closes the
+/// port. Indices are free-running u32 byte counts (they wrap at 2^32, never at
+/// the capacity), so `write - read` is the number of queued bytes and a ring is
+/// full when that equals `cap`. Each index has exactly one writer:
+///
+///   rx (host -> cart): OS writes `rx_write`, cart writes `rx_read`.
+///   tx (cart -> host): cart writes `tx_write`, OS writes `tx_read`.
+///
+/// Writers store the data bytes, then `dmb`, then the index. Readers load the
+/// index, then `dmb`, then the data bytes. The OS never drops received bytes:
+/// when rx is full it leaves the USB endpoint unarmed, so the host blocks
+/// (USB NAK) until the cart reads. While no host program has the port open
+/// (DTR low), the OS discards tx bytes so a cart never stalls on a closed port.
+pub const CartSerialRings = extern struct {
+    magic: u32 = CART_SERIAL_MAGIC,
+    rx_buf: [*]u8,
+    rx_cap: u32, // power of two, >= 64
+    rx_write: u32 = 0,
+    rx_read: u32 = 0,
+    tx_buf: [*]u8,
+    tx_cap: u32, // power of two, >= 64
+    tx_write: u32 = 0,
+    tx_read: u32 = 0,
+    /// Written by the OS only.
+    status: CartSerialStatus = .{},
+};
+
+pub const CART_SERIAL_MAGIC: u32 = 0x53455231; // "SER1"
+
+pub const CartSerialStatus = packed struct(u32) {
+    /// A host program has the port open (CDC DTR set).
+    host_open: bool = false,
+    /// The OS has seen the rings and is servicing them.
+    attached: bool = false,
+    _reserved: u30 = 0,
+};
 
 // Mailbox messages
 // zig fmt: off

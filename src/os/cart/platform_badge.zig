@@ -533,6 +533,110 @@ pub noinline fn outline_zone_end(time: i64, record_block: bool) void {
 
 // ┌───────────────────────────────────────────────────────────────────────────┐
 // │                                                                           │
+// │ Serial Functions (see serial.zig)                                         │
+// │                                                                           │
+// └───────────────────────────────────────────────────────────────────────────┘
+
+// The cart side of the CartSerialRings protocol (os_abi.zig). The cart owns
+// the struct and both buffers; the OS (Core 0) services them. Fields the OS
+// writes (rx_write, tx_read, status) are read through a volatile pointer, and
+// every index store is ordered against the data with a dmb.
+
+var serial_rings_storage: abi.CartSerialRings = .{ .rx_buf = undefined, .rx_cap = 0, .tx_buf = undefined, .tx_cap = 0 };
+const serial_rings: *volatile abi.CartSerialRings = &serial_rings_storage;
+var serial_open_flag: bool = false;
+
+inline fn dmb() void {
+    asm volatile ("dmb" ::: .{ .memory = true });
+}
+
+pub fn serial_supported() bool {
+    return ipc_data.os_flags.cart_serial_supported;
+}
+
+pub fn serial_open(rx: []u8, tx: []u8) error{Unsupported}!void {
+    if (serial_open_flag) return;
+    if (!serial_supported()) return error.Unsupported;
+    serial_rings.* = .{
+        .rx_buf = rx.ptr,
+        .rx_cap = @intCast(rx.len),
+        .tx_buf = tx.ptr,
+        .tx_cap = @intCast(tx.len),
+    };
+    // The struct must be complete before the OS can see its address.
+    dmb();
+    ipc_data.cart_serial = &serial_rings_storage;
+    serial_open_flag = true;
+}
+
+pub fn serial_close() void {
+    if (!serial_open_flag) return;
+    ipc_data.cart_serial = null;
+    dmb();
+    serial_open_flag = false;
+}
+
+pub fn serial_is_open() bool {
+    return serial_open_flag;
+}
+
+pub fn serial_connected() bool {
+    if (!serial_open_flag) return false;
+    const status = serial_rings.status;
+    return status.attached and status.host_open;
+}
+
+pub fn serial_write(bytes: []const u8) usize {
+    if (!serial_open_flag) return 0;
+    const cap = serial_rings.tx_cap;
+    const read_index = serial_rings.tx_read; // written by the OS
+    // The OS may still be reading the bytes we are about to overwrite until
+    // it publishes tx_read, so order that load before our data stores.
+    dmb();
+    const write_index = serial_rings.tx_write;
+    const space = cap - (write_index -% read_index);
+    const n: u32 = @intCast(@min(bytes.len, space));
+    const buf = serial_rings.tx_buf;
+    for (bytes[0..n], 0..) |b, i| {
+        buf[(write_index +% @as(u32, @intCast(i))) & (cap - 1)] = b;
+    }
+    // Data first, then the index that publishes it.
+    dmb();
+    serial_rings.tx_write = write_index +% n;
+    return n;
+}
+
+pub fn serial_read(buf: []u8) usize {
+    if (!serial_open_flag) return 0;
+    const cap = serial_rings.rx_cap;
+    const write_index = serial_rings.rx_write; // written by the OS
+    // Load the index before the data it covers.
+    dmb();
+    const read_index = serial_rings.rx_read;
+    const queued = write_index -% read_index;
+    const n: u32 = @intCast(@min(buf.len, queued));
+    const ring = serial_rings.rx_buf;
+    for (buf[0..n], 0..) |*b, i| {
+        b.* = ring[(read_index +% @as(u32, @intCast(i))) & (cap - 1)];
+    }
+    // Finish reading the data before handing the space back to the OS.
+    dmb();
+    serial_rings.rx_read = read_index +% n;
+    return n;
+}
+
+pub fn serial_bytes_available() usize {
+    if (!serial_open_flag) return 0;
+    return serial_rings.rx_write -% serial_rings.rx_read;
+}
+
+pub fn serial_space_available() usize {
+    if (!serial_open_flag) return 0;
+    return serial_rings.tx_cap - (serial_rings.tx_write -% serial_rings.tx_read);
+}
+
+// ┌───────────────────────────────────────────────────────────────────────────┐
+// │                                                                           │
 // │ Other Functions                                                           │
 // │                                                                           │
 // └───────────────────────────────────────────────────────────────────────────┘

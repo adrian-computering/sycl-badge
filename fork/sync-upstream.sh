@@ -17,6 +17,8 @@ FEATURES=(
   feature/net-lobby:feature/cart-serial
 )
 IN_PROGRESS=(
+  feature/ext-flash:upstream/main
+  feature/cart-saves:upstream/main
 )
 
 ZIG="${ZIG:-zig}"

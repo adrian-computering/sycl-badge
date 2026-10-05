@@ -223,11 +223,26 @@ const led_b_pos = fpoint(3, 0);
 
 var neopixel_colors: [5]abi.NeopixelColor = @splat(.{ .r = 0, .g = 0, .b = 0 });
 
+extern fn srand(seed: c_uint) void;
+extern fn time(t: ?*anyopaque) c_long;
+
+/// cart.rand() is libc rand() in the simulator. Seed it so every simulator run
+/// (and every one of several side by side) gets its own sequence, as on the
+/// badge, where it is a hardware random bit. The stack address differs per
+/// process (ASLR), the clock per run.
+fn seed_cart_rand() void {
+    var marker: u8 = 0;
+    const addr: usize = @intFromPtr(&marker);
+    const seed = @as(u64, @bitCast(@as(i64, time(null)))) ^ (@as(u64, addr) *% 0x9E3779B97F4A7C15);
+    srand(@truncate(seed ^ (seed >> 32)));
+}
+
 pub fn main(init: std.process.Init) !void {
     gpa = init.gpa;
     io = init.io;
 
     init_audio_points();
+    seed_cart_rand();
 
     // Cart serial over TCP (fork): see serial.zig for the port choice.
     const args = try init.minimal.args.toSlice(init.arena.allocator());

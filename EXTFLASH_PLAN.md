@@ -32,7 +32,7 @@ Branch `ext-flash` of a fresh upstream clone (base 5955625). Local only; not pus
 `carts/extflash-probe`: works on stock firmware. Routes GPIO0, reads SFDP (5Ah),
 ID (90h), 03h data and a 64 KB speed test through window 1. Hardware result pending.
 
-### E1 — OS bring-up
+### E1 — OS bring-up (DONE, 7750276; untested on hardware)
 - `src/os/drivers/ext_flash.zig`: detect at boot (SFDP signature + JEDEC density via
   window 1, no direct mode needed), on success declare CS1 in boot RAM devinfo
   (GPIO0, size from SFDP), set window 1 to 0Bh fast read; on failure restore GPIO0 /
@@ -42,9 +42,11 @@ ID (90h), 03h data and a 64 KB speed test through window 1. Hardware result pend
 - Cart ABI: `os_flags.ext_flash` + `ext_flash_size` (was `_reserved[0]`); cart API
   `ext_flash()` returns the read-only 0x11000000 slice or null (old OS, no chip, sim).
 - Console: `extflash` (info), `extflash read <off> [len]`, `extflash test confirm`
-  (save sector, erase, program pattern, verify, restore).
+  (save sector, erase, program pattern, verify, restore). NOTE: upstream's USB CDC
+  input is stubbed (usb.receive returns 0), so the console is unreachable today; the
+  probe cart's OS page runs the same write self-test through the cart API instead.
 
-### E2 — second USB drive on the external chip
+### E2 — second USB drive on the external chip (DONE; untested on hardware)
 - USB MSC LUN 1 = a FAT12 volume "SYCLEXTRA" spanning the chip (2 MB fits FAT12 with
   512 B clusters). LUN 0 stays byte-identical: no reformat of existing drives on update.
   Without the chip, max LUN stays 0 = today's behaviour.
@@ -53,6 +55,8 @@ ID (90h), 03h data and a 64 KB speed test through window 1. Hardware result pend
 - Cart menu, console `cart` and loader list/run carts from both volumes.
 - Cart-visible: files on the extra volume are memory-mapped at 0x11000000 + offset,
   same FAT12 layout as the main drive, so drive-ROM readers only need the base.
+- Volume = chip minus the 256 KB cart area = 1792 KB, 128 root entries, formatted on
+  first boot with the chip. Duplicate cart names: the main drive's copy wins.
 
 ### E3 — later / deferred
 - Quad reads (QE bit via direct mode at boot) if the 0Bh speed is not enough.

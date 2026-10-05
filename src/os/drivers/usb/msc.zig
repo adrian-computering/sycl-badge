@@ -205,6 +205,8 @@ pub fn MSC_Driver(comptime SetupProcessor: type, comptime config: Config) type {
             receiving_sectors: SectorTransfer,
 
             const SectorTransfer = struct {
+                /// Storage volume index (= LUN)
+                lun: u8,
                 tag: u32,
                 transfer_len: u32,
                 start: u32,
@@ -326,6 +328,16 @@ pub fn MSC_Driver(comptime SetupProcessor: type, comptime config: Config) type {
                     const tag = cbw.tag.native();
                     const transfer_len = cbw.transfer_len.native();
                     log.debug("opcode={} next_phase={}", .{ opcode, next_phase });
+                    // LUN 0 = main drive, LUN 1 = external flash drive (when present)
+                    const lun = cbw.lun;
+                    if (lun >= storage.volumeCount()) {
+                        log.warn("command for missing lun {}", .{lun});
+                        // ILLEGAL REQUEST / LOGICAL UNIT NOT SUPPORTED
+                        self.sense = .{ .key = 0x05, .asc = 0x25, .ascq = 0x00 };
+                        self.queue_csw(tag, transfer_len, transfer_len, .failed);
+                        return;
+                    }
+                    const volume = storage.volume(lun);
                     switch (opcode) {
                         .test_unit_ready => {
                             log.info("test_unit_ready", .{});
@@ -364,7 +376,7 @@ pub fn MSC_Driver(comptime SetupProcessor: type, comptime config: Config) type {
                             // Bytes 8-15: Vendor ID (8 bytes, space-padded)
                             @memcpy(resp[8..16], "SYCL    ");
                             // Bytes 16-31: Product ID (16 bytes, space-padded)
-                            @memcpy(resp[16..32], "BadgeCarts      ");
+                            @memcpy(resp[16..32], if (lun == 0) "BadgeCarts      " else "BadgeExtra      ");
                             // Bytes 32-35: Product Revision (4 bytes)
                             @memcpy(resp[32..36], "1.0 ");
 
@@ -373,7 +385,7 @@ pub fn MSC_Driver(comptime SetupProcessor: type, comptime config: Config) type {
                         .read_capacity => {
                             const read_capacity: *const scsi.cdb.ReadCapacity10 = @ptrCast(@alignCast(&cbw.command_data[1]));
                             log.info("read_capacity: {}", .{read_capacity});
-                            const total = storage.totalSectors() - 1;
+                            const total = storage.totalSectors(volume) - 1;
                             var writer: std.Io.Writer = .fixed(&self.buf_in);
                             writer.writeInt(u32, total, .big) catch unreachable;
                             writer.writeInt(u32, @intCast(storage.SECTOR_SIZE), .big) catch unreachable;
@@ -398,7 +410,7 @@ pub fn MSC_Driver(comptime SetupProcessor: type, comptime config: Config) type {
 
                             log.info("read_10: lba: 0x{X}, transfer_len: {}", .{ read_10.lba.native(), read_10.transfer_len.native() });
 
-                            self.send_sectors(tag, transfer_len, lba, logical_blocks);
+                            self.send_sectors(lun, tag, transfer_len, lba, logical_blocks);
                         },
                         .write_10 => {
                             const write_10: *const scsi.cdb.Write10 = @ptrCast(@alignCast(&cbw.command_data[1]));
@@ -407,7 +419,7 @@ pub fn MSC_Driver(comptime SetupProcessor: type, comptime config: Config) type {
 
                             log.info("write_10: lba: 0x{X}, transfer_len: {}", .{ write_10.lba.native(), write_10.transfer_len.native() });
 
-                            self.receive_sectors(tag, transfer_len, lba, logical_blocks);
+                            self.receive_sectors(lun, tag, transfer_len, lba, logical_blocks);
                         },
                         .request_sense => {
                             const request_sense: *const scsi.cdb.RequestSense = @ptrCast(@alignCast(&cbw.command_data[1]));
@@ -435,7 +447,7 @@ pub fn MSC_Driver(comptime SetupProcessor: type, comptime config: Config) type {
                             log.info("read_capacity_16", .{});
                             const read_capacity: *const scsi.cdb.ReadCapacity16 = @ptrCast(@alignCast(&cbw.command_data[1]));
                             _ = read_capacity;
-                            const total: u64 = storage.totalSectors() - 1;
+                            const total: u64 = storage.totalSectors(volume) - 1;
                             var writer: std.Io.Writer = .fixed(&self.buf_in);
                             writer.writeInt(u64, total, .big) catch unreachable;
                             writer.writeInt(u32, @intCast(storage.SECTOR_SIZE), .big) catch unreachable;
@@ -445,7 +457,7 @@ pub fn MSC_Driver(comptime SetupProcessor: type, comptime config: Config) type {
                             log.info("read_format_capacities", .{});
                             const read_format_capacities: *const scsi.cdb.ReadFormatCapacities = @ptrCast(@alignCast(&cbw.command_data[1]));
                             _ = read_format_capacities;
-                            const total = storage.totalSectors();
+                            const total = storage.totalSectors(volume);
                             var writer: std.Io.Writer = .fixed(&self.buf_in);
                             writer.splatByteAll(0, 3) catch unreachable;
                             // Capacity list length = 8
@@ -490,7 +502,7 @@ pub fn MSC_Driver(comptime SetupProcessor: type, comptime config: Config) type {
 
                     if (sm.block_offset == 0) {
                         log.debug("sending_sectors: reading sector", .{});
-                        storage.readSector(sm.lba, &self.buf_in);
+                        storage.readSector(storage.volume(sm.lun), sm.lba, &self.buf_in);
                         sm.lba += 1;
                     }
 
@@ -522,7 +534,7 @@ pub fn MSC_Driver(comptime SetupProcessor: type, comptime config: Config) type {
                     config.callbacks.queue_receive(self.endpoints.out.pid);
 
                     if (sm.block_offset >= storage.SECTOR_SIZE) {
-                        storage.writeSector(sm.lba, &self.buf_out);
+                        storage.writeSector(storage.volume(sm.lun), sm.lba, &self.buf_out);
                         sm.block_offset = 0;
                         sm.lba += 1;
                     }
@@ -573,9 +585,10 @@ pub fn MSC_Driver(comptime SetupProcessor: type, comptime config: Config) type {
             });
         }
 
-        fn send_sectors(self: *@This(), tag: u32, transfer_len: u32, lba: u32, logical_blocks: u32) void {
+        fn send_sectors(self: *@This(), lun: u8, tag: u32, transfer_len: u32, lba: u32, logical_blocks: u32) void {
             self.set_state(.{
                 .sending_sectors = .{
+                    .lun = lun,
                     .tag = tag,
                     .transfer_len = transfer_len,
                     .start = lba,
@@ -586,9 +599,10 @@ pub fn MSC_Driver(comptime SetupProcessor: type, comptime config: Config) type {
             });
         }
 
-        fn receive_sectors(self: *@This(), tag: u32, transfer_len: u32, lba: u32, logical_blocks: u32) void {
+        fn receive_sectors(self: *@This(), lun: u8, tag: u32, transfer_len: u32, lba: u32, logical_blocks: u32) void {
             self.set_state(.{
                 .receiving_sectors = .{
+                    .lun = lun,
                     .tag = tag,
                     .transfer_len = transfer_len,
                     .start = lba,

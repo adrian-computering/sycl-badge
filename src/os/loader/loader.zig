@@ -274,7 +274,7 @@ fn loadUF2FromStorage(cart_info: storage.CartInfo) LoadError!mailbox.MessageType
         return LoadError.InvalidUF2;
     }
 
-    var file: storage.FileIterator = .init(cart_info.size, cart_info.start_cluster);
+    var file: storage.FileIterator = .init(cart_info);
 
     var parser = uf2.Parser{};
 

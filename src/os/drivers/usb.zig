@@ -134,7 +134,8 @@ const SetupProcessor = setup.RequestPacketProcessor(.{
 });
 
 fn get_max_lun(_: ?*anyopaque) u4 {
-    return 0;
+    // One LUN per storage volume: the main drive, plus the external flash drive.
+    return @intCast(storage.volumeCount() - 1);
 }
 
 fn bulk_only_mass_storage_reset(_: ?*anyopaque) void {}

@@ -967,14 +967,21 @@ fn cmdGpioList(iter: *std.mem.TokenIterator(u8, .scalar)) void {
 // Storage Statistics Command - Show filesystem details
 fn cmdStorage(iter: *std.mem.TokenIterator(u8, .scalar)) void {
     _ = iter;
+    var index: u8 = 0;
+    while (index < storage.volumeCount()) : (index += 1) {
+        printStorageStats(index);
+    }
+}
 
-    println("\r\n=== Storage Filesystem Statistics ===\r\n");
+fn printStorageStats(index: u8) void {
+    const volume = storage.volume(index);
+    printf("\r\n=== Storage Filesystem Statistics: {s} (LUN {d}) ===\r\n\r\n", .{ volume.label, index });
 
-    const stats = storage.getStats();
+    const stats = storage.getStats(volume);
 
     // Overall filesystem info
-    printf("Total Storage:     {d} KB ({d} bytes)\r\n", .{ stats.total_size_bytes / 1024, stats.total_size_bytes });
-    printf("FAT12 Filesystem:  {d} sectors x 512 bytes\r\n\r\n", .{storage.totalSectors()});
+    printf("Total Storage:     {d} KB ({d} bytes) at 0x{X}\r\n", .{ stats.total_size_bytes / 1024, stats.total_size_bytes, volume.base });
+    printf("FAT12 Filesystem:  {d} sectors x 512 bytes\r\n\r\n", .{storage.totalSectors(volume)});
 
     // Filesystem layout
     println("--- Filesystem Layout ---");

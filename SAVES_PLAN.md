@@ -188,3 +188,28 @@ Monorepo (snouty-badge, branch `saves/m1`, never merged to main until Adrian say
 3. Write 32 KB: note the time on screen. Pull power mid-write once: after reboot the
    counter and the previous blob are intact.
 4. Start+Select -> Exit cart: save-test shows "saved on exit" next boot.
+
+## Merging with ext-flash (agreed with the ext-flash session, 2026-10-05)
+
+No ABI clash: saves use msg 0x2C and no IPC fields; ext-flash uses 0x2B, os_flags bits
+2-4 and 0x200350F8/FC (cart serial keeps bit 1 + 0x200350F4). On merge:
+
+1. `flash_ops.runRaw` saves and restores QMI window 1 too (M1_TIMING/RFMT/RCMD at
+   0x400D0020/24/28), the same way as window 0. With CS1 in FLASH_DEVINFO the bootrom's
+   `flash_enter_cmd_xip` resets both windows. Window 1 uses 0Bh serial reads (no
+   continuous mode), so a register restore is enough; no re-entry read.
+2. The window 0 quad restore is skipped while CS1 is mapped and the external chip's QE
+   bit is not set (ext_flash QeStatus): with QE clear, SD2/SD3 are that chip's
+   WP#/HOLD# and quad traffic garbles it. The ext-flash side owns this condition.
+3. Every flash write goes through flash_ops: storage.zig (per-Volume flushPending,
+   eraseBlock, wipeVolume) and ext_flash.zig's eraseRaw/programRaw. CS1 offsets are
+   0x01000000 + n (the bootrom picks CS1 from bit 24). flash_ops only checks alignment
+   and SRAM source; it must never assert offsets into the internal 4 MB.
+   `ext_flash.checkRange` stays the CS1 guard.
+4. Convention for both: a cart waiting on a flash write or erase parks in RAM with
+   PRIMASK set.
+5. Expected textual conflicts, all mechanical: loader.zig (XIP removal vs
+   loadUF2CartEntry), the kernel.zig main loop (both poll one flash step per pass),
+   console.zig, storage.zig.
+6. Open, for Adrian, after saves ship: whether ext-flash's 256 KB raw cart area at the
+   chip's end becomes a second save-store backend or stays raw scratch.

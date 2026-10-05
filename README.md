@@ -1,5 +1,9 @@
 # Software You Can Love Badge
 
+> **This is a fork** of [ZigEmbeddedGroup/sycl-badge](https://github.com/ZigEmbeddedGroup/sycl-badge)
+> that tracks upstream `main` and adds a USB serial console and a cart serial
+> port for multiplayer. See [FORK.md](FORK.md).
+
 Welcome to the SYCL badge repository.
 
 ## Quick Start

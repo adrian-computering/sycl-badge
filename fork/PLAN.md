@@ -100,11 +100,19 @@ Constraints:
   merge review (EP0 stalls, control OUT data stage, string 0), composite
   device with both CDC ports, chip id serial number, cart serial service with
   host tests, console `id`. Untested on hardware.
+- 2026-10-05: M1-B (cart.serial on the badge, simulator TCP serial,
+  cart.lobby with self-echo, serial-echo + lobby-demo carts) and M1-C
+  (`badge` tool, relay with pluggable links, benchmark: 16 carts x 60 Hz
+  p50 0.16 ms / p99 5.4 ms at 8% of a core) done.
+- 2026-10-05: M2 integration: all tracks merged on `feature/cart-serial`,
+  `zig build` + `zig build test` + 105 Python tests pass; end to end in the
+  simulator with the real relay: 3 and 16 lobby-demo simulators in one room,
+  joins, roster, relayed positions, pings, leaves. Merged to `main`.
+  Next: show-day hardware checks below, then M3 (monorepo carts).
 
 ## Deferred questions (defaults taken)
 
-- Fork remote: needs a GitHub repo (suggested `antithesishq/sycl-badge`) plus
-  an exe.dev integration; until then branches are local in
-  `/home/exedev/sycl-badge-fork`.
+- Fork remote: Adrian creates the GitHub repo later; until then branches are
+  local in `/home/exedev/sycl-badge-fork`.
 - Room cap 16 players (ROSTER fits one frame).
 - Port numbering for simulators starts at 7341.

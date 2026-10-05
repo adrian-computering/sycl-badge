@@ -230,6 +230,11 @@ test "a data stage the request did not take is dropped, not handed to the next r
 }
 
 test "requests without a handler and oversized data stages are stalled" {
+    // The unhandled request below logs a warning on purpose; keep test output clean.
+    const saved_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = saved_log_level;
+
     var proc = new_processor();
     try enumerate_a_bit(&proc);
 

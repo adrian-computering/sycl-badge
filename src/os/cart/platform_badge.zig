@@ -174,6 +174,10 @@ pub fn ext_flash_diag() u32 {
     return ipc_data.ext_flash_diag;
 }
 
+pub fn ext_flash_volume() u8 {
+    return ipc_data.os_flags.ext_volume;
+}
+
 var ext_flash_req: abi.ExtFlashRequest align(4) = undefined;
 
 /// Ask core 0 to erase or program the external flash and wait for it. This

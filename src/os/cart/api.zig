@@ -210,11 +210,18 @@ pub fn ext_flash_cart_area() ?[]const u8 {
 }
 
 /// Boot-time detection report, for diagnostics: 0xE2 in the top byte on
-/// firmware with external flash support, then attempts, result
-/// (0 ok, 1 no SFDP signature, 2 not JEDEC, 3 bad density) and the first
-/// SFDP byte read. Anything else means older firmware.
+/// firmware with external flash support, then attempts (bit 7: found at cart
+/// start), quad-enable status << 4 | result (0 ok, 1 no SFDP signature,
+/// 2 not JEDEC, 3 bad density), and status register 2 once found (else the
+/// first SFDP byte read). Anything else means older firmware.
 pub fn ext_flash_diag() u32 {
     return platform.ext_flash_diag();
+}
+
+/// What boot did with the external USB drive: 0 none, 1 kept its files,
+/// 2 formatted it, 3 reads unstable so it was left out.
+pub fn ext_flash_volume() u8 {
+    return platform.ext_flash_volume();
 }
 
 pub const ExtFlashError = error{ Unsupported, OutOfRange, Misaligned, BadBuffer };

@@ -115,6 +115,10 @@ var sector_bufs: [2][SECTOR_SIZE]u8 align(8) = undefined;
 
 pub var formatted_this_boot: bool = false;
 
+/// What boot did with the external drive (reported to carts in os_flags).
+pub const ExtVolumeState = enum(u2) { none = 0, kept = 1, formatted = 2, unstable = 3 };
+pub var ext_volume_state: ExtVolumeState = .none;
+
 pub fn init() void {
     volumes[0] = .{
         .base = @intFromPtr(&__romfs_region_start__),
@@ -137,9 +141,21 @@ pub fn init() void {
     }
 
     // Check if filesystem size matches expected (reformat if changed)
-    for (volumes[0..volume_count]) |*v| {
+    for (volumes[0..volume_count], 0..) |*v, index| {
         if (!is_formatted(v) or !isSizeCorrect(v)) {
+            // The external chip has given garbled reads before (see
+            // ext_flash.QeStatus): never reformat it on reads that don't
+            // repeat. Leave the drive out for this boot instead.
+            if (index == 1 and !ext_flash.readsAgree(0, 2 * SECTOR_SIZE)) {
+                log.err("external volume: reads unstable, not mounting", .{});
+                ext_volume_state = .unstable;
+                volume_count = 1;
+                break;
+            }
             formatVolume(v);
+            if (index == 1) ext_volume_state = .formatted;
+        } else if (index == 1) {
+            ext_volume_state = .kept;
         }
     }
     if (volume_count > 1) {

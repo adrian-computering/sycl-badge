@@ -789,6 +789,7 @@ fn init_cart_ipc_data() void {
     abi.ipc_data.os_flags = .{
         .os_clear_supported = false, // TODO OS clear
         .ext_flash = ext_flash.present(),
+        .ext_volume = @intFromEnum(storage.ext_volume_state),
     };
     abi.ipc_data.ext_flash_size = ext_flash.size();
     abi.ipc_data.ext_flash_cart_offset = ext_flash.cartAreaOffset();

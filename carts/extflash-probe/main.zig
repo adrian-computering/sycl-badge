@@ -253,10 +253,16 @@ fn draw() void {
         }
         const d = cart.ext_flash_diag();
         if (d >> 24 == 0xE2) {
-            const res: u8 = @truncate(d >> 8);
+            const res: u8 = @truncate((d >> 8) & 0xF);
+            const qe: u8 = @truncate((d >> 12) & 0xF);
             const names = [_][]const u8{ "ok", "no SFDP sig", "not JEDEC", "bad density" };
+            const qe_names = [_][]const u8{ "not tried", "already on", "SET NOW", "skipped", "FAILED" };
+            const vol_names = [_][]const u8{ "none", "kept", "formatted", "UNSTABLE" };
+            const vol = cart.ext_flash_volume();
             say(white, "boot check: {s}", .{if (res < names.len) names[res] else "?"});
-            say(white, "tries {d} byte0 {X:0>2}", .{ (d >> 16) & 0x7F, d & 0xFF });
+            say(white, "tries {d} byte {X:0>2}", .{ (d >> 16) & 0x7F, d & 0xFF });
+            say(if (qe == 1 or qe == 2) green else red, "QE: {s}", .{if (qe < qe_names.len) qe_names[qe] else "?"});
+            say(if (vol == 1 or vol == 2) green else red, "drive: {s}", .{if (vol < vol_names.len) vol_names[vol] else "?"});
             if ((d >> 16) & 0x80 != 0) say(yellow, "found late (cart start)", .{});
         } else {
             say(red, "OS has no ext-flash", .{});

@@ -89,10 +89,20 @@ var info: ?Info = null;
 
 /// Boot detection outcome for carts (ipc ext_flash_diag), so a probe can tell
 /// this firmware from stock even when the chip check fails:
-/// magic 0xE2 << 24 | attempts << 16 | DetectResult << 8 | first SFDP byte seen.
+/// magic 0xE2 << 24 | attempts << 16 | QeStatus << 12 | DetectResult << 8 |
+/// low byte: status register 2 once found, else the first SFDP byte seen.
 pub const diag_magic: u32 = 0xE2;
 pub const DetectResult = enum(u8) { ok = 0, no_signature = 1, not_jedec = 2, bad_density = 3 };
 var diag: u32 = 0;
+
+/// The chip's quad-enable bit (status register 2 bit 1). With it clear,
+/// SD2/SD3 are the chip's WP#/HOLD# inputs. Those lines are shared with the
+/// internal flash, which drives them in its quad XIP reads, so the external
+/// chip pauses mid-read at random until the OS drops window 0 to serial
+/// reads (any bootrom flash write does that). Setting QE (non-volatile, done
+/// once at boot) turns WP#/HOLD# off for good.
+pub const QeStatus = enum(u4) { not_tried = 0, already = 1, set_now = 2, skipped = 3, failed = 4 };
+const SR2_QE: u8 = 1 << 1;
 
 pub fn bootDiag() u32 {
     return diag;
@@ -123,7 +133,7 @@ pub fn bytes() ?[]const u8 {
     return p[0..i.size];
 }
 
-fn reg(addr: usize) *volatile u32 {
+inline fn reg(addr: usize) *volatile u32 {
     return @ptrFromInt(addr);
 }
 
@@ -143,7 +153,7 @@ fn setWindow1(timing: u32, rfmt: u32, cmd: u32) void {
 /// rom.connect_internal_flash() (QSPI pads) and before calling it again
 /// (which then keeps GPIO0 on XIP_CS1).
 pub fn init() void {
-    bringUp(detect_attempts);
+    bringUp(detect_attempts, true);
 }
 
 /// One more detection attempt when a cart starts, if boot didn't find the
@@ -153,7 +163,7 @@ pub fn init() void {
 pub fn retryLate() void {
     if (info != null) return;
     const boot_diag = diag;
-    bringUp(1);
+    bringUp(1, false);
     // Keep the boot report unless this attempt worked.
     diag = if (info != null) diag | (late_flag << 16) else boot_diag;
 }
@@ -161,7 +171,9 @@ pub fn retryLate() void {
 /// Set in the attempts byte of the diag word when retryLate() found the chip.
 pub const late_flag: u32 = 0x80;
 
-fn bringUp(attempts: u32) void {
+/// allow_qe: may set the quad-enable bit, which takes XIP down for a moment
+/// (boot only: core 1 must not be fetching from flash).
+fn bringUp(attempts: u32, allow_qe: bool) void {
     const saved_ctrl = reg(IO_BANK0_GPIO_CTRL).*;
     const saved_pad = reg(PADS_BANK0_GPIO).*;
     const saved_timing = reg(M1_TIMING).*;
@@ -189,6 +201,11 @@ fn bringUp(attempts: u32) void {
     if (found_info) |found| {
         info = found;
         setDevinfo(found.size);
+        if (allow_qe) {
+            const qe = ensureQuadEnable();
+            diag = (diag & 0xFFFF_0F00) | (@as(u32, @intFromEnum(qe.status)) << 12) | qe.sr2;
+            log.info("external flash: QE {s}, SR1 0x{X:0>2} SR2 0x{X:0>2}", .{ @tagName(qe.status), qe.sr1, qe.sr2 });
+        }
         applyReadMode();
         log.info("external flash: {d} KB, id {X:0>2} {X:0>2}, SFDP {d}.{d}", .{
             found.size / 1024, found.manufacturer, found.device, found.sfdp_major, found.sfdp_minor,
@@ -199,6 +216,144 @@ fn bringUp(attempts: u32) void {
         reg(PADS_BANK0_GPIO).* = saved_pad;
         log.info("external flash: not found (result {d}, first byte 0x{X:0>2})", .{ @intFromEnum(result), first_byte });
     }
+}
+
+const QeResult = struct { status: QeStatus, sr1: u8 = 0, sr2: u8 = 0 };
+
+/// Status register 2 through window 1 (35h; the chip repeats it for as long
+/// as it is clocked, so the address phase just goes by). Needs no direct
+/// mode, so the OS keeps its fast window 0 when QE is already set. A HOLD
+/// glitch can garble a read, so QE only counts as set when three reads agree.
+fn quadEnabledXip() bool {
+    setWindow1(DETECT_TIMING, RFMT_PREFIX_LEN_8, 0x35);
+    var sr2: [1]u8 = undefined;
+    var n: u32 = 0;
+    while (n < 3) : (n += 1) {
+        readNoCache(0, &sr2);
+        if (sr2[0] & SR2_QE == 0 or sr2[0] & ~SR2_QE != 0) return false;
+    }
+    return true;
+}
+
+fn ensureQuadEnable() QeResult {
+    if (quadEnabledXip()) return .{ .status = .already, .sr2 = SR2_QE };
+    var r: QeResult = .{ .status = .failed };
+    quadEnableRaw(&r);
+    return r;
+}
+
+const QMI_DIRECT_CSR = QMI_BASE + 0x00;
+const QMI_DIRECT_TX = QMI_BASE + 0x04;
+const QMI_DIRECT_RX = QMI_BASE + 0x08;
+const DIRECT_EN: u32 = 1 << 0;
+const DIRECT_BUSY: u32 = 1 << 1;
+const DIRECT_ASSERT_CS1N: u32 = 1 << 3;
+const DIRECT_TXFULL: u32 = 1 << 10;
+const DIRECT_RXEMPTY: u32 = 1 << 16;
+
+/// Leaves window 0 in the bootrom's 03h serial mode, like any OS flash write,
+/// so it costs OS speed for this boot only (QE then stays set).
+noinline fn quadEnableRaw(out: *QeResult) linksection(".ram_text") void {
+    const cs = interrupt.enter_critical_section();
+    defer cs.leave();
+    rom.flash_exit_xip();
+    out.* = quadEnableDirect();
+    rom.flash_flush_cache();
+    rom.flash_enter_cmd_xip();
+}
+
+/// Everything below runs with XIP off: RAM code, stack buffers filled byte by
+/// byte (no .rodata, no memcpy).
+fn quadEnableDirect() linksection(".ram_text") QeResult {
+    const sr1 = readSr(0x05);
+    const sr2 = readSr(0x35);
+    if (sr2 & SR2_QE != 0) return .{ .status = .already, .sr1 = sr1, .sr2 = sr2 };
+    // Factory state is all zeros. Leave anything else alone: protection bits,
+    // and SR2 holds one-time lock bits that must never be written by mistake.
+    if (sr1 != 0 or sr2 != 0 or readSr(0x05) != sr1 or readSr(0x35) != sr2)
+        return .{ .status = .skipped, .sr1 = sr1, .sr2 = sr2 };
+
+    // 31h writes SR2 alone on current GigaDevice parts.
+    writeEnable();
+    var tx: [3]u8 = undefined;
+    var rx: [3]u8 = undefined;
+    tx[0] = 0x31;
+    tx[1] = SR2_QE;
+    directXfer(tx[0..2], rx[0..2]);
+    if (!waitIdle()) return .{ .status = .failed, .sr1 = readSr(0x05), .sr2 = readSr(0x35) };
+    var now = readSr(0x35);
+    if (now & SR2_QE == 0) {
+        // Older parts only take SR2 as the second data byte of 01h.
+        writeEnable();
+        tx[0] = 0x01;
+        tx[1] = sr1;
+        tx[2] = SR2_QE;
+        directXfer(tx[0..3], rx[0..3]);
+        if (!waitIdle()) return .{ .status = .failed, .sr1 = readSr(0x05), .sr2 = readSr(0x35) };
+        now = readSr(0x35);
+    }
+    return .{ .status = if (now & SR2_QE != 0) .set_now else .failed, .sr1 = readSr(0x05), .sr2 = now };
+}
+
+fn writeEnable() linksection(".ram_text") void {
+    var tx: [1]u8 = undefined;
+    var rx: [1]u8 = undefined;
+    tx[0] = 0x06;
+    directXfer(tx[0..1], rx[0..1]);
+}
+
+fn readSr(cmd: u8) linksection(".ram_text") u8 {
+    var tx: [2]u8 = undefined;
+    var rx: [2]u8 = undefined;
+    tx[0] = cmd;
+    tx[1] = 0;
+    directXfer(tx[0..2], rx[0..2]);
+    return rx[1];
+}
+
+/// Poll WIP; a status register write takes a few ms (30 ms worst case).
+fn waitIdle() linksection(".ram_text") bool {
+    var n: u32 = 0;
+    while (n < 1_000_000) : (n += 1) {
+        if (readSr(0x05) & 1 == 0) return true;
+    }
+    return false;
+}
+
+/// One CS1 transaction in QMI direct mode (as pico-sdk flash_do_cmd): each
+/// byte sent clocks one byte into rx.
+fn directXfer(tx: []const u8, rx: []u8) linksection(".ram_text") void {
+    reg(QMI_DIRECT_CSR).* |= DIRECT_EN;
+    reg(QMI_DIRECT_CSR).* |= DIRECT_ASSERT_CS1N;
+    var t: usize = 0;
+    var r: usize = 0;
+    while (t < tx.len or r < rx.len) {
+        const flags = reg(QMI_DIRECT_CSR).*;
+        if (t < tx.len and flags & DIRECT_TXFULL == 0) {
+            reg(QMI_DIRECT_TX).* = tx[t];
+            t += 1;
+        }
+        if (r < rx.len and flags & DIRECT_RXEMPTY == 0) {
+            rx[r] = @truncate(reg(QMI_DIRECT_RX).*);
+            r += 1;
+        }
+    }
+    while (reg(QMI_DIRECT_CSR).* & DIRECT_BUSY != 0) {}
+    reg(QMI_DIRECT_CSR).* &= ~DIRECT_ASSERT_CS1N;
+    reg(QMI_DIRECT_CSR).* &= ~DIRECT_EN;
+}
+
+/// Two uncached passes over the same bytes agree. storage checks this before
+/// reformatting the drive, so a garbled read can't wipe it.
+pub fn readsAgree(offset: u32, len: u32) bool {
+    return hashNoCache(offset, len) == hashNoCache(offset, len);
+}
+
+fn hashNoCache(offset: u32, len: u32) u32 {
+    const src: [*]const volatile u8 = @ptrFromInt(base_nocache + offset);
+    var h: u32 = 2166136261;
+    for (0..len) |i| h = (h ^ src[i]) *% 16777619;
+    return h;
 }
 
 /// ABh (release from deep power-down): command, three dummy bytes in the

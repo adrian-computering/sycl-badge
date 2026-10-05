@@ -75,7 +75,10 @@ pub const CartIPCData = extern struct {
         os_clear_supported: bool,
         /// The external QSPI flash is mapped read-only at ext_flash_base.
         ext_flash: bool = false,
-        _reserved: u14 = 0,
+        /// What boot did with the external drive: 0 none, 1 kept,
+        /// 2 formatted, 3 reads unstable so not mounted.
+        ext_volume: u2 = 0,
+        _reserved: u12 = 0,
     },
 
     cart_dma_channels: u16,            // x150EC..x150EE

@@ -13,6 +13,7 @@ pub const Rect8 = api.Rect8;
 
 pub const SaveRequest = os_abi.SaveRequest;
 pub const SaveOp = os_abi.SaveOp;
+pub const SaveState = os_abi.SaveState;
 pub const SaveStatus = os_abi.SaveStatus;
 pub const SaveStat = os_abi.SaveStat;
 pub const SaveListEntry = os_abi.SaveListEntry;

@@ -543,6 +543,8 @@ var save_supported_cache: ?bool = null;
 /// ever answers it, and a late answer must not land in a dead stack frame.
 var save_probe_req: abi.SaveRequest = .{ .op = .probe };
 const save_probe_timeout_us: u64 = 250_000;
+/// A request the OS hasn't picked up after this long is abandoned (Busy).
+const save_pending_timeout_us: u64 = 2_000_000;
 
 pub fn save_supported() bool {
     if (save_supported_cache) |v| return v;
@@ -564,15 +566,18 @@ pub fn save_transact(op: abi.SaveOp, key: []const u8, buf: ?[*]u8, len: u32, res
     @memcpy(req.key[0..key.len], key);
     // Core 0 switches XIP off while it erases/programs for a write or delete:
     // keep this core's interrupts masked meanwhile (their vectors may be in flash).
-    _ = save_wait(&req, op == .write or op == .delete, 0);
+    if (!save_wait(&req, op == .write or op == .delete, save_pending_timeout_us)) {
+        result.* = 0;
+        return .busy;
+    }
     result.* = req.result;
     return req.status;
 }
 
 /// Sends the request and spins until state == done. Runs from RAM like all of a
-/// badge cart and touches no XIP address. With timeout_us != 0, gives up (false)
-/// if the request is still `pending` (never picked up) after that long; once
-/// the OS marks it busy it waits for done.
+/// badge cart and touches no XIP address. Gives up (false, magic zeroed so a
+/// late pick-up is ignored) if the request is still `pending` (never picked up)
+/// after timeout_us; once the OS marks it busy it waits for done.
 noinline fn save_wait(req: *abi.SaveRequest, mask_irqs: bool, timeout_us: u64) bool {
     const r: *volatile abi.SaveRequest = req;
     r.state = .pending;
@@ -595,7 +600,11 @@ noinline fn save_wait(req: *abi.SaveRequest, mask_irqs: bool, timeout_us: u64) b
         asm volatile ("dmb" ::: .{ .memory = true });
         const state = r.state;
         if (state == .done) return true;
-        if (timeout_us != 0 and state == .pending and micros_since_boot() - start >= timeout_us) return false;
+        if (state == .pending and micros_since_boot() - start >= timeout_us) {
+            r.magic = 0;
+            asm volatile ("dmb" ::: .{ .memory = true });
+            return false;
+        }
         // Keep the OS's FIFO replies (FRAMEBUFFER_DONE etc.) flowing so core 0
         // never blocks on a full FIFO while serving us.
         if (fifo_try_recv()) |msg| handle_os_message(msg);

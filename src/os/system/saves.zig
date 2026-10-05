@@ -192,6 +192,9 @@ pub fn onMessage(payload: u24) void {
     }
     const req: *volatile abi.SaveRequest = @ptrFromInt(addr);
 
+    // A client that gave up on a request zeroes its magic: leave it alone.
+    if (req.magic == 0) return;
+
     if (active) |a| {
         // The in-flight request is answered when it finishes; a different one
         // is told to come back later.
@@ -330,18 +333,12 @@ fn serve(req: *volatile abi.SaveRequest, addr: u32) void {
         .stat => {
             const s = store.stat(now);
             if (len != 0) {
-                if (len < @sizeOf(abi.SaveStat) or buf % 4 != 0 or !inCartRam(buf, @sizeOf(abi.SaveStat)))
-                    return finish(req, .bad_buffer, 0);
-                const out: *volatile abi.SaveStat = @ptrFromInt(buf);
-                out.* = .{
-                    .version = s.version,
-                    .region_bytes = s.region_bytes,
-                    .free_bytes = s.free_bytes,
-                    .max_blob = s.max_blob,
-                    .entries = s.entries,
-                    .max_entries = s.max_entries,
-                    .writes_left_now = s.writes_left_now,
-                };
+                // Copy min(len, @sizeOf(SaveStat)) bytes, byte by byte (any alignment).
+                const n: u32 = @min(len, @sizeOf(abi.SaveStat));
+                if (!inCartRam(buf, n)) return finish(req, .bad_buffer, 0);
+                const bytes = std.mem.asBytes(&s);
+                const out: [*]volatile u8 = @ptrFromInt(buf);
+                for (0..n) |i| out[i] = bytes[i];
             }
             finish(req, .ok, s.free_bytes);
         },

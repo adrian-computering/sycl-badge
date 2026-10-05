@@ -888,7 +888,7 @@ pub const SaveStat = os_abi.SaveStat;
 pub const SaveListEntry = os_abi.SaveListEntry;
 pub const save_max_blob: u32 = 64 * 1024;
 pub const save_max_key: u32 = 32;
-pub const save_max_entries: u32 = 63;
+pub const save_max_entries: u32 = 46;
 
 pub const SaveError = error{
     /// The OS has no cart saves (stock firmware).

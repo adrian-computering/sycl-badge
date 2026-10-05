@@ -1,5 +1,16 @@
 # Software You Can Love Badge
 
+> **External flash firmware: one lasting change to the badge.** This branch
+> (`feature/ext-flash`) enables the board's second 2 MB flash chip (U8). On the
+> first boot that finds the chip, it sets the chip's **QE (quad enable) bit**,
+> a non-volatile bit in the chip's own status register, so it **stays set after
+> you flash any other firmware**. That is harmless: stock firmware never uses
+> the chip, and QE only turns the chip's WP#/HOLD# pins into data pins (they
+> would otherwise garble its reads, see [fork/EXT_FLASH.md](fork/EXT_FLASH.md)).
+> It is set only from the factory all-zero status registers and can be cleared
+> again by writing status register 2 back to 0. Files on the extra drive also
+> stay on the chip, hidden, under other firmware.
+
 Welcome to the SYCL badge repository.
 
 ## Quick Start

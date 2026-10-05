@@ -96,6 +96,10 @@ Constraints:
 ## Status
 
 - 2026-10-05: M0 done. M1 tracks launched.
+- 2026-10-05: M1-A OS done on `cart-serial/os`: setup processor fixes from the
+  merge review (EP0 stalls, control OUT data stage, string 0), composite
+  device with both CDC ports, chip id serial number, cart serial service with
+  host tests, console `id`. Untested on hardware.
 
 ## Deferred questions (defaults taken)
 

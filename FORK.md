@@ -28,7 +28,7 @@ every plugged-in badge are one command:
 `badge flash zig-out/firmware/sycl-os-kernel.uf2 --all` (see `tools/badge`).
 
 The console is the "SYCL Badge Console" serial port: `/dev/ttyACM0` or
-`/dev/serial/by-id/*SYCL*-if01` on Linux, `/dev/cu.usbmodem*1` on macOS, a COM
+`/dev/serial/by-id/*SYCL*-if01` on Linux, a `/dev/cu.usbmodem*` on macOS, a COM
 port on Windows. Open it with any terminal (`tio`, `screen`, PuTTY) or
 `badge console`, and type `help`.
 

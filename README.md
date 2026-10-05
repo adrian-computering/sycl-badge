@@ -1,8 +1,16 @@
 # Software You Can Love Badge
 
+> **AI-authored fork.** The changes in this fork beyond upstream were written
+> by AI (Anthropic's Claude) at Adrian Hatch's direction; each commit carries a
+> `Co-Authored-By: Claude` trailer. The USB console is Carl Sverre's upstream
+> PRs #159 and #160, merged unchanged. It is shared as a reference for the
+> badge's maintainers, not submitted upstream.
+>
 > **This is a fork** of [ZigEmbeddedGroup/sycl-badge](https://github.com/ZigEmbeddedGroup/sycl-badge)
-> that tracks upstream `main` and adds a USB serial console and a cart serial
-> port for multiplayer. See [FORK.md](FORK.md).
+> that tracks upstream `main` and adds a USB serial console, a cart serial
+> port for multiplayer, support for the board's second 2 MB flash chip, and
+> cart saves. Each is its own branch; `main` combines them. See
+> [FORK.md](FORK.md).
 
 Welcome to the SYCL badge repository.
 

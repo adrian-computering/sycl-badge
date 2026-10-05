@@ -87,4 +87,7 @@ the feature branch, and update the table above.
 
 If a feature changes the cart ABI (`src/os/cart/os_abi.zig`), it must take
 reserved space only, flag itself in `os_flags`, and keep stock-firmware carts
-working. Write down the offsets you used in its doc so other SDKs can follow.
+working. Claim the space in [fork/ABI.md](fork/ABI.md) first (it lists every
+bit, word and mailbox type the fork and sibling OS branches use; the IPC words
+are all taken, so new features use a mailbox message), and write the offsets
+in the feature's doc so other SDKs can follow.

@@ -36,10 +36,17 @@ pub fn update() void {
         .joined => |j| { _ = j; },       // j.you = your player id
         .roster => {},                   // lobby.players() changed
         .data => |d| { _ = d; },         // d.from, d.bytes
+        else => {},                      // .left, .host_error
     };
-    lobby.broadcast(&my_state_bytes);
+    lobby.broadcast(&my_state_bytes) catch {}; // not joined yet, or host busy
 }
 ```
+
+`send(to, bytes)` reaches one player, `broadcast` everyone else and
+`broadcast_with_echo` everyone including yourself (your own message comes back
+as `.data` at its place in the room's order). Sends fail with
+`error.NotJoined`, `error.TooLong` (over 240 bytes) or `error.QueueFull` (the
+host is not reading; nothing was sent).
 
 `lobby.state()` tells the player what is happening: `.unsupported` (stock
 firmware: hide the multiplayer menu), `.waiting_for_host` (plug in / run
@@ -50,7 +57,9 @@ In the simulator the cart serial port is a TCP socket. The simulator prints
 `cart serial: tcp://127.0.0.1:7341` at startup (the first free port from 7341
 up, or `--serial-port N` / `SYCL_SERIAL_PORT=N`). `badge list` and
 `badge lobby` find simulators on 7341-7356 automatically, so two simulators and
-a lobby on one laptop is a complete multiplayer test with no hardware.
+a lobby on one laptop is a complete multiplayer test with no hardware. The
+simulator serves one client at a time: while one is connected, a second
+connection is reset right away (so a probe never kicks out the lobby).
 
 ## Quick start (badge owner)
 
@@ -72,18 +81,32 @@ The badge is one composite USB device:
 | 1-2 | CDC ACM "SYCL Badge Console" | OS shell + `cart.trace()` output |
 | 3-4 | CDC ACM "SYCL Badge Cart Serial" | the running cart's serial port |
 
-The USB serial number is the RP2350 chip id (16 hex digits), unique per badge,
-so ports have stable names: `/dev/serial/by-id/usb-*_SYCL_Badge_V2_<id>-if03`
-on Linux, `/dev/cu.usbmodem*` on macOS (two per badge; console first), a COM
-port on Windows. `badge list` shows which port is which on every OS.
-The baud rate setting is ignored; the port always runs at USB speed.
+Each CDC function sits behind an interface association descriptor and the
+device class is Miscellaneous/Common/IAD, so Linux (`cdc_acm`), macOS and
+Windows 10+ (`usbser`) bind both ports without drivers. Endpoints: EP1 mass
+storage, EP2 (bulk) and EP3 (notifications) console, EP4 (bulk) and EP5
+(notifications) cart serial, all 64 byte full speed packets.
+
+The USB serial number is the RP2350 chip id as 16 uppercase hex digits, the
+same digits `picotool info` and the pico-sdk report for the chip, unique per
+badge. Ports therefore have stable names:
+`/dev/serial/by-id/usb-*_SYCL_Badge_V2_<id>-if03` on Linux, `/dev/cu.usbmodem*`
+on macOS, a COM port on Windows; tools should find the cart port by USB serial
+number and interface number (3) rather than by name; `badge list` shows
+which port is which on every OS. The console's `id`
+command prints the chip id. The baud rate setting is ignored; the port always
+runs at USB speed.
 
 Behavior of the cart port:
 
 - **No cart has the port open:** bytes from the host are discarded and the
   host can still open the port.
-- **Cart open, host not connected (DTR low):** bytes the cart writes are
-  discarded, so a cart never stalls on a closed port. `connected()` is false.
+- **Cart open, host not connected (DTR low, or the bus suspended or the cable
+  unplugged):** bytes the cart writes are discarded, so a cart never stalls on
+  a closed port. `connected()` is false. Bytes from the host are still
+  delivered. One packet (at most 64 bytes) the cart wrote just before the host
+  closed the port may still be waiting in the badge and arrive when the host
+  next opens it; framed protocols resynchronize past it.
 - **Both open:** reliable, ordered, lossless. When the cart's receive ring is
   full the badge stops accepting USB data, so the host's writes block until the
   cart reads.
@@ -120,9 +143,13 @@ Indices are free-running byte counts, so `write - read` (wrapping u32
 subtraction) is the number of queued bytes, and byte `i` lives at
 `buf[i & (cap - 1)]`. Writers store data, `dmb`, then the index; readers load
 the index, `dmb`, then data. To open: fill the struct with zeroed indices, `dmb`,
-store its address to `cart_serial`. To close: store 0. The OS validates the
-magic, sizes and that both rings lie in cart RAM, and ignores a struct that
-fails; `status.attached` turns on once it is serviced.
+store its address to `cart_serial`. To close: store 0. Every pass the OS
+validates the magic, the sizes, that the struct (4-byte aligned) and both
+rings lie in cart RAM (`0x20035100`-`0x20080000`), and that the rings overlap
+neither each other nor the struct; it ignores a struct that fails.
+`status.attached` turns on once it is serviced. Keep the struct and the rings
+in static memory: right after the cart stores 0 the OS may still finish the
+pass it is in.
 
 ## Lobby protocol v1
 
@@ -173,7 +200,12 @@ Error codes: 1 unsupported version, 2 no room (server full), 3 not joined
 - A cart sends HELLO when it opens the port and again whenever `connected()`
   goes from false to true (the lobby restarted, or the cable was replugged).
   A HELLO from a cart that is already in a room is a rejoin: it leaves the old
-  room first.
+  room first, exactly like a LEAVE. The other members always get the ROSTER
+  without the player before any ROSTER that has it again, so a rejoin is
+  visible as a leave plus a join even when the player gets the same room and
+  id back. (It can land in another room or get another id: placement is a
+  fresh join. If it was alone, the old room closes and a new one opens.) The
+  rejoining cart gets WELCOME, then the new room's ROSTER.
 - The host puts a new player in the first room with the same `game` that has a
   free slot, otherwise opens a new room. A room's size is the first member's
   `max_players` (capped at 16). Rooms with different `game` ids never mix, so

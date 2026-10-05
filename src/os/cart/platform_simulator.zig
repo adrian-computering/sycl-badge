@@ -137,35 +137,46 @@ pub fn audio_submit_samples(num: usize) void {
 // │                                                                           │
 // └───────────────────────────────────────────────────────────────────────────┘
 
-// M0 interface stubs: the port reports unsupported until M1 lands.
+// In the simulator the cart serial port is a TCP socket on 127.0.0.1 served
+// by the simulator host (src/simulator/serial.zig), which reads and writes the
+// cart's own ring buffers.
+
+var serial_open_flag: bool = false;
+
 pub fn serial_supported() bool {
-    return false;
+    return true;
 }
 pub fn serial_open(rx: []u8, tx: []u8) error{Unsupported}!void {
-    _ = rx;
-    _ = tx;
-    return error.Unsupported;
+    if (serial_open_flag) return;
+    simulator_io_block.api.serial_open(rx.ptr, @intCast(rx.len), tx.ptr, @intCast(tx.len));
+    serial_open_flag = true;
 }
-pub fn serial_close() void {}
+pub fn serial_close() void {
+    if (!serial_open_flag) return;
+    simulator_io_block.api.serial_close();
+    serial_open_flag = false;
+}
 pub fn serial_is_open() bool {
-    return false;
+    return serial_open_flag;
 }
 pub fn serial_connected() bool {
-    return false;
+    return serial_open_flag and simulator_io_block.api.serial_connected();
 }
 pub fn serial_write(bytes: []const u8) usize {
-    _ = bytes;
-    return 0;
+    if (!serial_open_flag) return 0;
+    return simulator_io_block.api.serial_write(bytes.ptr, bytes.len);
 }
 pub fn serial_read(buf: []u8) usize {
-    _ = buf;
-    return 0;
+    if (!serial_open_flag) return 0;
+    return simulator_io_block.api.serial_read(buf.ptr, buf.len);
 }
 pub fn serial_bytes_available() usize {
-    return 0;
+    if (!serial_open_flag) return 0;
+    return simulator_io_block.api.serial_bytes_available();
 }
 pub fn serial_space_available() usize {
-    return 0;
+    if (!serial_open_flag) return 0;
+    return simulator_io_block.api.serial_space_available();
 }
 
 // ┌───────────────────────────────────────────────────────────────────────────┐

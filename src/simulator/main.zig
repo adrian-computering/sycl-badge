@@ -3,6 +3,7 @@ const sdl = @import("sdl3");
 const cart = @import("cart_thread.zig");
 const abi = cart.abi;
 const assets = @import("assets.zig");
+const serial = @import("serial.zig");
 
 const log = std.log.scoped(.simulator);
 
@@ -227,6 +228,18 @@ pub fn main(init: std.process.Init) !void {
     io = init.io;
 
     init_audio_points();
+
+    // Cart serial over TCP (fork): see serial.zig for the port choice.
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const serial_port = serial.port_from_args(args, init.environ_map) catch {
+        std.debug.print("cart serial: invalid --serial-port / SYCL_SERIAL_PORT\n", .{});
+        std.process.exit(2);
+    };
+    serial.start(io, serial_port) catch |err| {
+        std.debug.print("cart serial: unavailable ({t})\n", .{err});
+        if (serial_port != null) std.process.exit(1);
+    };
+    defer serial.stop();
 
     if (!sdl.SDL_SetAppMetadata("Example Renderer Clear", "1.0", "com.example.renderer-clear")) {
         std.debug.panic("SDL_SetAppMetadata failed: {s}\n", .{sdl.SDL_GetError()});

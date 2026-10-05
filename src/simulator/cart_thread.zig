@@ -2,6 +2,7 @@ const std = @import("std");
 pub const abi = @import("sim_abi");
 const sdl = @import("sdl3");
 const root = @import("root");
+const serial = @import("serial.zig");
 
 extern fn cart_must_call_export_start_code() void;
 extern var simulator_io_block: abi.SimulatorIO;
@@ -151,6 +152,13 @@ const sim_api: abi.SimulatorAPI = .{
     .check_flags = &cart_check_flags,
     .set_flags = &cart_set_flags,
     .wait_for_flags = &cart_wait_for_flags,
+    .serial_open = &serial.cart_serial_open,
+    .serial_close = &serial.cart_serial_close,
+    .serial_connected = &serial.cart_serial_connected,
+    .serial_read = &serial.cart_serial_read,
+    .serial_write = &serial.cart_serial_write,
+    .serial_bytes_available = &serial.cart_serial_bytes_available,
+    .serial_space_available = &serial.cart_serial_space_available,
 };
 
 fn cart_mark_canceled() void {

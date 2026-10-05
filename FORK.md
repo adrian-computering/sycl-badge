@@ -11,7 +11,7 @@ fork features detect stock firmware at run time and degrade gracefully.
 | Feature | Branch | Status | Docs |
 |---|---|---|---|
 | USB serial console (restores the console and `cart.trace()` output over USB, lost in upstream #136) | `feature/usb-console` | merged | below |
-| Cart serial port and multiplayer lobby (`cart.serial`, `cart.lobby`, `badge lobby`) | `feature/cart-serial` | in progress | [fork/CART_SERIAL.md](fork/CART_SERIAL.md) |
+| Cart serial port and multiplayer lobby (`cart.serial`, `cart.lobby`, `badge lobby`) | `feature/cart-serial` | merged (untested on hardware) | [fork/CART_SERIAL.md](fork/CART_SERIAL.md) |
 
 The USB console comes from Carl Sverre's upstream PRs #159 and #160, merged
 as-is so upstream can tell them apart.

@@ -1,4 +1,4 @@
-"""Command line: badge list | console | monitor | flash | install | lobby."""
+"""Command line: badge list | console | monitor | flash | install | lobby | join."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import sys
 import time
 from typing import List, Optional
 
-from . import __version__, discover, flash, frames
+from . import __version__, discover, flash, frames, net
 from .discover import Badge, SelectError
 
 
@@ -302,11 +302,16 @@ def cmd_lobby(args) -> int:
     if args.port:
         server.add_source(lobby_mod.StaticSource(args.port))
         what.append(", ".join(args.port))
+    stop_network = net.start_lobby_network(args, server, log)
+    if args.listen or args.tailcat:
+        what.append("players joining over the network")
     log("lobby v%d: watching %s; Ctrl-C stops" % (frames.VERSION, ", ".join(what) or "nothing"))
     try:
         server.run()
     except KeyboardInterrupt:
         pass
+    finally:
+        stop_network()
     print()
     log("lobby stopped: %d frames in, %d out" % (server.frames_in, server.frames_out))
     return 0
@@ -316,7 +321,7 @@ def cmd_lobby(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="badge", description="SYCL badge host tool: list, console, monitor, flash, install, lobby.")
+    p = argparse.ArgumentParser(prog="badge", description="SYCL badge host tool: list, console, monitor, flash, install, lobby, join.")
     p.add_argument("--version", action="version", version="badge " + __version__)
     sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
 
@@ -373,7 +378,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--stats", type=float, default=10.0, metavar="SECONDS", help="print per-player rates every N seconds (0 = off, default 10)")
     sp.add_argument("--queue-limit", type=int, default=64 * 1024, metavar="BYTES", help="drop a player that stops reading once this much output is waiting (default 65536)")
     sp.add_argument("-v", "--verbose", action="store_true", help="log every message")
+    net.add_lobby_args(sp)
     sp.set_defaults(func=cmd_lobby)
+
+    net.add_join_parser(sub)
     return p
 
 

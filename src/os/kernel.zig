@@ -495,7 +495,7 @@ fn handle_cart_message(msg: u32, sync_time: *bool) void {
         sync_time.* = true;
     } else if (mailbox.MessageType.getType(msg) == abi.EXT_FLASH_REQ) {
         const status = handle_ext_flash_request(mailbox.MessageType.getPayload(msg));
-        mailbox.send((@as(u32, abi.EXT_FLASH_DONE) << 24) | @intFromEnum(status));
+        mailbox.send((@as(u32, abi.EXT_FLASH_DONE) << 24) | @backingInt(status));
     } else if (mailbox.MessageType.getType(msg) == abi.CART_SAVE_REQ) {
         saves.onMessage(mailbox.MessageType.getPayload(msg));
     }
@@ -834,7 +834,7 @@ fn init_cart_ipc_data() void {
         .os_clear_supported = false, // TODO OS clear
         .cart_serial_supported = true,
         .ext_flash = ext_flash.present(),
-        .ext_volume = @intFromEnum(storage.ext_volume_state),
+        .ext_volume = @backingInt(storage.ext_volume_state),
     };
     abi.ipc_data.ext_flash_size_kb = @intCast(ext_flash.size() / 1024);
     abi.ipc_data.ext_flash_cart_offset_kb = @intCast(ext_flash.cartAreaOffset() / 1024);

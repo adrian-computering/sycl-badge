@@ -239,6 +239,10 @@ Error codes: 1 unsupported version, 2 no room (server full), 3 not joined
 - A player leaves when it sends LEAVE or HELLO for another game, its port
   closes, or the badge disappears. The host closes the port of a badge it
   stops seeing.
+- Before its HELLO, a link hears nothing from the host except the leading
+  `0x00` and PONGs: the host answers PING at any time, joined or not, and
+  sends a link no room traffic until it joins. (`badge join` relies on this
+  to check a new hub connection with a PING before it opens the cart port.)
 - Unknown message types are ignored by both sides, so later versions can add
   messages without breaking v1 peers. Bytes after the end of a fixed-size
   payload are ignored too, so later versions can append fields. A host-to-cart

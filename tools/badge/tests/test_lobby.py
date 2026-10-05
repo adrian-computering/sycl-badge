@@ -308,6 +308,19 @@ class ErrorTest(unittest.TestCase):
         h.body("a", frames.Ping(token=0xDEADBEEF).pack())
         self.assertEqual(h.take("a"), [frames.Pong(token=0xDEADBEEF)])
 
+    def test_link_before_hello_hears_only_pongs(self):
+        # badge join (net.py) relies on this: PING through a fresh hub link,
+        # wait for its PONG, and nothing else arrives until HELLO.
+        h = Harness()
+        h.hello("b")
+        h.hello("c")
+        h.connect("a")
+        h.send("b", 0xFF, b"x")
+        h.send("c", EVERYONE, b"y")
+        h.body("a", frames.Ping(token=7).pack())
+        h.disconnect("c")
+        self.assertEqual(h.take("a"), [frames.Pong(token=7)])
+
     def test_garbage_then_hello(self):
         h = Harness()
         h.connect("a")

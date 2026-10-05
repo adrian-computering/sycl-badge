@@ -605,17 +605,21 @@ pub fn poll() void {
 /// The frame number of the last start of frame packet, and when it changed
 var last_frame: u11 = 0;
 var last_frame_ms: u64 = 0;
+var frame_seen = false;
 
 /// True while the host sends a start of frame packet every millisecond. The
 /// frame number is watched rather than SIE_STATUS.SUSPENDED, a sticky flag.
+/// Until the frame number first changes the bus counts as active, so if it
+/// never did the ports would behave as before rather than stay closed.
 fn bus_active() bool {
     const frame = USB.SOF_RD.read().COUNT;
     const now = timer.millis();
     if (frame != last_frame) {
         last_frame = frame;
         last_frame_ms = now;
+        frame_seen = true;
     }
-    return now - last_frame_ms < 20;
+    return !frame_seen or now - last_frame_ms < 20;
 }
 
 /// Sends console output to the host. Output waits in a buffer until a terminal

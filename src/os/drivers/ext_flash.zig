@@ -196,14 +196,14 @@ fn bringUp(attempts: u32, allow_qe: bool) void {
         found_info = detect(&result, &first_byte);
         if (found_info != null) break;
     }
-    diag = (diag_magic << 24) | (attempt << 16) | (@as(u32, @intFromEnum(result)) << 8) | first_byte;
+    diag = (diag_magic << 24) | (attempt << 16) | (@as(u32, @backingInt(result)) << 8) | first_byte;
 
     if (found_info) |found| {
         info = found;
         setDevinfo(found.size);
         if (allow_qe) {
             const qe = ensureQuadEnable();
-            diag = (diag & 0xFFFF_0F00) | (@as(u32, @intFromEnum(qe.status)) << 12) | qe.sr2;
+            diag = (diag & 0xFFFF_0F00) | (@as(u32, @backingInt(qe.status)) << 12) | qe.sr2;
             log.info("external flash: QE {s}, SR1 0x{X:0>2} SR2 0x{X:0>2}", .{ @tagName(qe.status), qe.sr1, qe.sr2 });
         }
         applyReadMode();
@@ -214,7 +214,7 @@ fn bringUp(attempts: u32, allow_qe: bool) void {
         setWindow1(saved_timing, saved_rfmt, saved_rcmd);
         reg(IO_BANK0_GPIO_CTRL).* = saved_ctrl;
         reg(PADS_BANK0_GPIO).* = saved_pad;
-        log.info("external flash: not found (result {d}, first byte 0x{X:0>2})", .{ @intFromEnum(result), first_byte });
+        log.info("external flash: not found (result {d}, first byte 0x{X:0>2})", .{ @backingInt(result), first_byte });
     }
 }
 

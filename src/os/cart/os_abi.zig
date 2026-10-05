@@ -151,7 +151,6 @@ pub const ExtFlashRequest = extern struct {
     len: u32,
 };
 
-
 pub const PresentFlags = packed struct(u32) {
     framebuffer_index: u1,
     has_dirty_rect: bool,

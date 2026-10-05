@@ -200,7 +200,7 @@ pub noinline fn ext_flash_request(op: abi.ExtFlashOp, offset: u32, src: u32, len
     fifo_send((@as(u32, abi.EXT_FLASH_REQ) << 24) | word);
     while (true) {
         const msg = fifo_recv();
-        if (msg >> 24 == abi.EXT_FLASH_DONE) return @enumFromInt(@as(u24, @truncate(msg)));
+        if (msg >> 24 == abi.EXT_FLASH_DONE) return @fromBackingInt(@intCast(@as(u24, @truncate(msg))));
         handle_os_message(msg);
     }
 }

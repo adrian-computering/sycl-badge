@@ -27,6 +27,7 @@ const mailbox = @import("ipc/mailbox.zig");
 const abi = @import("cart/os_abi.zig");
 const Controls = abi.Controls;
 const i2c = @import("drivers/i2c.zig");
+const ext_flash = @import("drivers/ext_flash.zig");
 
 // Use panic handler from system
 pub const panic = @import("system/panic.zig").panic;
@@ -467,8 +468,39 @@ fn handle_cart_message(msg: u32, sync_time: *bool) void {
         }
     } else if (msg == abi.SYNC_TIME_REQ_CLR) {
         sync_time.* = true;
+    } else if (mailbox.MessageType.getType(msg) == abi.EXT_FLASH_REQ) {
+        const status = handle_ext_flash_request(mailbox.MessageType.getPayload(msg));
+        mailbox.send((@as(u32, abi.EXT_FLASH_DONE) << 24) | @intFromEnum(status));
     }
     // Other messages (e.g. CART_FINISHED) handled by loader state machine.
+}
+
+fn handle_ext_flash_request(payload: u24) abi.ExtFlashStatus {
+    // An XIP cart executes from flash, which is paused during erase/program.
+    if (loader.getEntryPoint().xip) return .unsupported;
+    const req_addr = 0x2000_0000 + @as(u32, payload) * 4;
+    const ram_start = loader.getCartRamStart();
+    const ram_end = loader.getCartRamEnd();
+    if (req_addr < ram_start or req_addr > ram_end - @sizeOf(abi.ExtFlashRequest)) return .bad_buffer;
+    const req: *const volatile abi.ExtFlashRequest = @ptrFromInt(req_addr);
+    const offset = req.offset;
+    const len = req.len;
+    const result = switch (req.op) {
+        .erase => ext_flash.cartErase(offset, len),
+        .program => blk: {
+            const src = req.src;
+            if (src < ram_start or src > ram_end or len > ram_end - src) return .bad_buffer;
+            const data: [*]const u8 = @ptrFromInt(src);
+            break :blk ext_flash.cartProgram(offset, data[0..len]);
+        },
+        _ => return .unsupported,
+    };
+    result catch |err| return switch (err) {
+        error.NotPresent => .unsupported,
+        error.OutOfRange => .out_of_range,
+        error.Misaligned => .misaligned,
+    };
+    return .ok;
 }
 
 pub fn updateNeopixels() void {
@@ -753,7 +785,10 @@ fn init_cart_ipc_data() void {
     terry.client.prepare_for_cart();
     abi.ipc_data.os_flags = .{
         .os_clear_supported = false, // TODO OS clear
+        .ext_flash = ext_flash.present(),
     };
+    abi.ipc_data.ext_flash_size = ext_flash.size();
+    abi.ipc_data.ext_flash_cart_offset = ext_flash.cartAreaOffset();
     abi.ipc_data.cart_dma_channels = board.cart_dma_mask;
 }
 

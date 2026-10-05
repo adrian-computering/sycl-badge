@@ -194,6 +194,65 @@ pub fn micros_since_boot() u64 {
     return platform.micros_since_boot();
 }
 
+/// The badge's external QSPI flash as read-only memory, or null when the OS
+/// doesn't map it (older firmware, chip not detected, simulator). Reads go
+/// through the XIP cache shared with the OS: fine for data, slow for code.
+pub fn ext_flash() ?[]const u8 {
+    return platform.ext_flash();
+}
+
+/// The part of the external flash carts may write (the end of the chip),
+/// as a read-only view, or null when unavailable. All carts share it: pick a
+/// fixed region and check your own header/magic before trusting the bytes.
+pub fn ext_flash_cart_area() ?[]const u8 {
+    const all = ext_flash() orelse return null;
+    return all[platform.ext_flash_cart_offset()..];
+}
+
+pub const ExtFlashError = error{ Unsupported, OutOfRange, Misaligned, BadBuffer };
+
+/// Wire format of external flash requests (see os_abi.EXT_FLASH_REQ).
+pub const ExtFlashOp = enum(u32) {
+    /// Erase whole 4 KB sectors.
+    erase = 1,
+    /// Program 256-byte pages (erased bits only go 1 -> 0).
+    program = 2,
+    _,
+};
+
+pub const ExtFlashStatus = enum(u24) {
+    ok = 0,
+    unsupported = 1,
+    out_of_range = 2,
+    misaligned = 3,
+    bad_buffer = 4,
+    _,
+};
+
+/// Erase 4 KB sectors of the cart area: offset and len are relative to
+/// ext_flash_cart_area() and multiples of 4096. Erased bytes read 0xFF.
+/// Blocks for about 45 ms per sector. Badge RAM carts only.
+pub fn ext_flash_erase(offset: u32, len: u32) ExtFlashError!void {
+    return extFlashStatus(platform.ext_flash_request(.erase, platform.ext_flash_cart_offset() + offset, 0, len));
+}
+
+/// Program erased bytes of the cart area: offset (relative to
+/// ext_flash_cart_area()) and data.len are multiples of 256. Programming can
+/// only clear bits, so erase first. data must live in cart RAM.
+pub fn ext_flash_program(offset: u32, data: []const u8) ExtFlashError!void {
+    return extFlashStatus(platform.ext_flash_request(.program, platform.ext_flash_cart_offset() + offset, @intFromPtr(data.ptr), data.len));
+}
+
+fn extFlashStatus(status: ExtFlashStatus) ExtFlashError!void {
+    return switch (status) {
+        .ok => {},
+        .out_of_range => error.OutOfRange,
+        .misaligned => error.Misaligned,
+        .bad_buffer => error.BadBuffer,
+        else => error.Unsupported,
+    };
+}
+
 /// Volatile: kernel (Core 0) writes button state every frame; cart must read fresh each access.
 pub const neopixels: *volatile [5]NeopixelColor = platform.neopixels;
 pub const user_led: *volatile bool = platform.user_led;

@@ -73,13 +73,17 @@ pub const CartIPCData = extern struct {
     clear_color: DisplayColor,         // x150E8..x150EA
     os_flags: packed struct (u16) {    // x150EA..x150EC
         os_clear_supported: bool,
-        _reserved: u15 = 0,
+        /// The external QSPI flash is mapped read-only at ext_flash_base.
+        ext_flash: bool = false,
+        _reserved: u14 = 0,
     },
 
     cart_dma_channels: u16,            // x150EC..x150EE
     _pad6: u16 = 0,                    // x150EE..x150F0
     app_time: u32,                     // x150F0..x150F4
-    _reserved: [3]u32 = @splat(0),     // x150F0..x15100
+    ext_flash_size: u32 = 0,           // x150F4..x150F8, bytes at ext_flash_base when os_flags.ext_flash
+    ext_flash_cart_offset: u32 = 0,    // x150F8..x150FC, start of the cart-writable area (to ext_flash_size)
+    _reserved: [1]u32 = @splat(0),     // x150FC..x15100
 
     comptime {
         // badge_cart.ld reserves 0x15100 bytes for IPC data.
@@ -90,6 +94,9 @@ pub const CartIPCData = extern struct {
 // zig fmt: on
 
 pub const ipc_data: *align(0x2000) volatile CartIPCData = @ptrFromInt(base);
+
+/// Cached XIP address of the external flash (QMI window 1).
+pub const ext_flash_base: usize = 0x11000000;
 
 // Mailbox messages
 // zig fmt: off
@@ -115,7 +122,28 @@ pub const OS_ACK_STOP_AUDIO    : u32 = 0x29000003;
 pub const SYNC_TIME_REQ_CLR    : u32 = 0x2a000001;
 pub const SYNC_TIME_ACK_CLR    : u32 = 0x2a000002;
 pub const SYNC_TIME_REQ_TIME   : u32 = 0x2a000003;
+
+/// External flash write request, cart -> OS. Payload = word offset of an
+/// ExtFlashRequest in cart RAM from 0x20000000. The cart must then wait for
+/// EXT_FLASH_DONE without touching XIP flash (RAM carts only): core 0 pauses
+/// XIP for both flash chips while it erases or programs.
+pub const EXT_FLASH_REQ        : u8 = 0x2B;
+/// Reply, OS -> cart. Payload = ExtFlashStatus.
+pub const EXT_FLASH_DONE       : u8 = 0x2B;
 // zig fmt: on
+
+pub const ExtFlashOp = api.ExtFlashOp;
+pub const ExtFlashStatus = api.ExtFlashStatus;
+
+pub const ExtFlashRequest = extern struct {
+    op: ExtFlashOp,
+    /// Byte offset from the start of the chip; must lie in the cart area.
+    offset: u32,
+    /// Source buffer address in cart RAM (program only).
+    src: u32,
+    len: u32,
+};
+
 
 pub const PresentFlags = packed struct(u32) {
     framebuffer_index: u1,

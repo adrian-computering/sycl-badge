@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Merge upstream/main into every fork feature branch, then all of them into
-# main, building and testing each branch. Stops at the first merge conflict or
+# Merge upstream/main into every fork feature branch, then the finished ones
+# into main, building and testing each branch. Stops at the first merge conflict or
 # failure; fix it on that branch, commit, and run the script again.
 #
 # Usage: fork/sync-upstream.sh [--no-build]
@@ -9,8 +9,12 @@ set -euo pipefail
 
 # Feature branches in merge order, as "branch" or "branch:base" when the
 # branch builds on another feature (which must be listed before it).
+# FEATURES are on main; IN_PROGRESS branches are kept current with upstream
+# but not merged into main until they move up to FEATURES.
 FEATURES=(
   feature/usb-console
+)
+IN_PROGRESS=(
   feature/cart-serial:feature/usb-console
 )
 
@@ -60,7 +64,7 @@ merge_into() { # merge_into <branch> <source>
 }
 
 branches=()
-for entry in "${FEATURES[@]}"; do
+for entry in "${FEATURES[@]}" "${IN_PROGRESS[@]}"; do
   branch="${entry%%:*}"
   base="${entry#*:}"
   [[ "$base" == "$entry" ]] && base=upstream/main
@@ -71,8 +75,8 @@ done
 
 changed=0
 merge_into main upstream/main && changed=1
-for branch in "${branches[@]}"; do
-  merge_into main "$branch" && changed=1
+for entry in "${FEATURES[@]}"; do
+  merge_into main "${entry%%:*}" && changed=1
 done
 if [[ $changed == 1 ]]; then check main; fi
 

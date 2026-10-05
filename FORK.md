@@ -76,11 +76,12 @@ the feature branch, and update the table above.
 
 ## Adding a feature
 
-1. `git switch -c feature/<name> upstream/main`
+1. `git switch -c feature/<name> upstream/main`, and add the branch to
+   `IN_PROGRESS` in `fork/sync-upstream.sh` so syncs keep it current.
 2. Build it. Keep upstream files' diffs small; put new code in new files.
 3. Document it: a section or file under `fork/`, and a row in the table above.
-4. `git switch main && git merge --no-ff feature/<name>`
-5. Add the branch to `FEATURES` in `fork/sync-upstream.sh`.
+4. When it works: `git switch main && git merge --no-ff feature/<name>`, and
+   move the branch from `IN_PROGRESS` to `FEATURES`.
 
 If a feature changes the cart ABI (`src/os/cart/os_abi.zig`), it must take
 reserved space only, flag itself in `os_flags`, and keep stock-firmware carts

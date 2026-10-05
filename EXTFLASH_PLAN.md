@@ -67,3 +67,20 @@ ID (90h), 03h data and a 64 KB speed test through window 1. Hardware result pend
 - Second drive vs one bigger drive: second LUN chosen (no reformat, safe fallback).
   One bigger drive would mean a reformat on update and a non-contiguous drive map.
 - Volume label `SYCLEXTRA`.
+
+## Hardware test (files in animated-badge:~/extflash-dist/)
+
+Step 1, stock firmware, zero risk: copy `extflash-probe.uf2` to the badge drive and run it.
+- Page 1: "CHIP ALIVE", "SFDP ok 2048KB", "ID C8 14 GD25Q16", a KB/s figure. The
+  "OS window 0" lines show how the show firmware reads its own flash.
+- If it says NO ANSWER, stop here and photograph pages 1 and 2 (B flips pages).
+
+Step 2, patched OS (`sycl-os-extflash-e2.uf2`): hold BOOT_SEL while power-cycling (or
+RESET+BOOT_SEL, release RESET first), copy the UF2 to the RP2350 drive. Only the 512 KB
+OS region is rewritten; the cart drive survives. Keep the organizers' OS UF2 to go back
+(`sycl-os-upstream-5955625.uf2` is plain upstream main if theirs is missing).
+- The computer should now mount TWO drives: the usual one and an empty "SYCLEXTRA".
+- Probe cart page 3 ("OS SUPPORT"): "ext_flash 2048KB", "cart area 256KB", then A runs
+  the write self-test: expect WRITE TEST PASS (erase ~45 ms, program a few ms).
+- Copy a cart UF2 onto SYCLEXTRA: it should appear in the badge menu and run.
+- If boot hangs or the drive misbehaves: re-flash the organizers' OS UF2.

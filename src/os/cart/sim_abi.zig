@@ -16,6 +16,16 @@ pub const SimulatorAPI = extern struct {
     check_flags: *const fn (u32) callconv(.c) bool,
     wait_for_flags: *const fn (u32) callconv(.c) void,
     set_flags: *const fn (u32) callconv(.c) void,
+
+    // Cart serial over TCP (fork, see fork/CART_SERIAL.md). The simulator
+    // services the cart's own ring buffers; all calls are non-blocking.
+    serial_open: *const fn (rx: [*]u8, rx_cap: u32, tx: [*]u8, tx_cap: u32) callconv(.c) void,
+    serial_close: *const fn () callconv(.c) void,
+    serial_connected: *const fn () callconv(.c) bool,
+    serial_read: *const fn (buf: [*]u8, len: usize) callconv(.c) usize,
+    serial_write: *const fn (bytes: [*]const u8, len: usize) callconv(.c) usize,
+    serial_bytes_available: *const fn () callconv(.c) usize,
+    serial_space_available: *const fn () callconv(.c) usize,
 };
 
 pub const SimulatorIO = extern struct {

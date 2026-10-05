@@ -36,10 +36,17 @@ pub fn update() void {
         .joined => |j| { _ = j; },       // j.you = your player id
         .roster => {},                   // lobby.players() changed
         .data => |d| { _ = d; },         // d.from, d.bytes
+        else => {},                      // .left, .host_error
     };
-    lobby.broadcast(&my_state_bytes);
+    lobby.broadcast(&my_state_bytes) catch {}; // not joined yet, or host busy
 }
 ```
+
+`send(to, bytes)` reaches one player, `broadcast` everyone else and
+`broadcast_with_echo` everyone including yourself (your own message comes back
+as `.data` at its place in the room's order). Sends fail with
+`error.NotJoined`, `error.TooLong` (over 240 bytes) or `error.QueueFull` (the
+host is not reading; nothing was sent).
 
 `lobby.state()` tells the player what is happening: `.unsupported` (stock
 firmware: hide the multiplayer menu), `.waiting_for_host` (plug in / run
@@ -50,7 +57,9 @@ In the simulator the cart serial port is a TCP socket. The simulator prints
 `cart serial: tcp://127.0.0.1:7341` at startup (the first free port from 7341
 up, or `--serial-port N` / `SYCL_SERIAL_PORT=N`). `badge list` and
 `badge lobby` find simulators on 7341-7356 automatically, so two simulators and
-a lobby on one laptop is a complete multiplayer test with no hardware.
+a lobby on one laptop is a complete multiplayer test with no hardware. The
+simulator serves one client at a time: while one is connected, a second
+connection is reset right away (so a probe never kicks out the lobby).
 
 ## Quick start (badge owner)
 

@@ -18,8 +18,9 @@ Branch `ext-flash` of a fresh upstream clone (base 5955625). Local only; not pus
   With CS1_SIZE/CS1_GPIO set there:
   - `connect_internal_flash` routes the CS1 GPIO to XIP_CS1 and clears pad isolation,
   - `flash_exit_xip` sends the XIP exit sequence to both chip selects,
-  - `flash_range_erase/program` pick the chip from `offset >> 24`
-    (offset 0x01000000 + n = CS1 byte n), bounds-checked against devinfo,
+  - `flash_range_erase/program` pick the chip from bit 24 of the offset
+    (offset 0x01000000 + n = CS1 byte n) with NO bounds check (only `flash_op`
+    checks), so the OS's own range checks are the only guard,
   - `flash_enter_cmd_xip` puts BOTH windows into 03h serial at clkdiv 12.
 - So the OS's existing write path (`addr - 0x10000000` as the flash offset) works for
   CS1 addresses 0x11xxxxxx unchanged once devinfo declares CS1.
@@ -55,6 +56,8 @@ ID (90h), 03h data and a 64 KB speed test through window 1. Hardware result pend
 - Cart menu, console `cart` and loader list/run carts from both volumes.
 - Cart-visible: files on the extra volume are memory-mapped at 0x11000000 + offset,
   same FAT12 layout as the main drive, so drive-ROM readers only need the base.
+- Cart requests are one 4 KB sector each (core 0 runs them in its main loop, where
+  USB is polled); the cart API loops.
 - Volume = chip minus the 256 KB cart area = 1792 KB, 128 root entries, formatted on
   first boot with the chip. Duplicate cart names: the main drive's copy wins.
 

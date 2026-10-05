@@ -13,8 +13,9 @@
 ///   3. declare CS1 in the bootrom's boot RAM copy of FLASH_DEVINFO.
 ///
 /// Step 3 is what makes the bootrom flash routines handle the chip: with CS1
-/// declared, flash_exit_xip also exits CS1, and flash_range_erase/program pick
-/// CS1 for flash offsets 0x01000000 and up. So an XIP address 0x11000000 + n
+/// declared, flash_exit_xip also exits CS1. flash_range_erase/program pick the
+/// chip from bit 24 of the offset alone (CS1 for 0x01000000 and up) and do NOT
+/// bounds-check against devinfo, so checkRange() here is the only guard. So an XIP address 0x11000000 + n
 /// maps to flash offset (addr - 0x10000000) exactly like the internal flash.
 /// flash_enter_cmd_xip resets both windows to slow 03h reads; the rom.zig
 /// wrapper calls applyReadMode() after it.
@@ -74,8 +75,6 @@ const READ_CMD: u32 = 0x0B;
 const DEVINFO_CS1_SIZE_LSB = 12;
 const DEVINFO_CS1_SIZE_MASK: u16 = 0xF000;
 const DEVINFO_CS1_GPIO_MASK: u16 = 0x003F;
-/// Boot RAM supports the SET/CLR/XOR register aliases, not exclusives.
-const REG_ALIAS_XOR: usize = 0x1000;
 
 pub const Info = struct {
     size: u32,
@@ -213,8 +212,9 @@ fn setDevinfo(chip_bytes: u32) void {
     const size_code: u16 = @intCast(std.math.log2_int(u32, chip_bytes / 4096));
     const wanted: u16 = (size_code << DEVINFO_CS1_SIZE_LSB) | CS1_GPIO;
     const mask: u16 = DEVINFO_CS1_SIZE_MASK | DEVINFO_CS1_GPIO_MASK;
-    const xor_alias: *volatile u16 = @ptrFromInt(@intFromPtr(devinfo) + REG_ALIAS_XOR);
-    xor_alias.* = (devinfo.* ^ wanted) & mask;
+    // Plain read-modify-write, as the bootrom itself stores this field; core 1
+    // isn't running yet, so nothing races it.
+    devinfo.* = (devinfo.* & ~mask) | wanted;
     log.debug("FLASH_DEVINFO now 0x{X:0>4}", .{devinfo.*});
 }
 
@@ -240,15 +240,20 @@ pub fn cartAreaOffset() u32 {
     return total - @min(cart_area_size, total / 2);
 }
 
-/// erase() limited to the cart area.
+/// Largest cart request: core 0 handles it inside its main loop, where USB is
+/// polled, so a request is one sector (erase up to ~300 ms worst case per the
+/// datasheet, ~45 ms typical). The cart API loops over larger ranges.
+pub const cart_max_request: u32 = sector_size;
+
+/// erase() limited to the cart area and one request's size.
 pub fn cartErase(offset: u32, len: usize) Error!void {
-    if (offset < cartAreaOffset()) return error.OutOfRange;
+    if (offset < cartAreaOffset() or len > cart_max_request) return error.OutOfRange;
     return erase(offset, len);
 }
 
-/// program() limited to the cart area.
+/// program() limited to the cart area and one request's size.
 pub fn cartProgram(offset: u32, data: []const u8) Error!void {
-    if (offset < cartAreaOffset()) return error.OutOfRange;
+    if (offset < cartAreaOffset() or data.len > cart_max_request) return error.OutOfRange;
     return program(offset, data);
 }
 

@@ -12,7 +12,7 @@
 //!   - 03h serial read: the first bytes of the array and a read speed test.
 //!
 //! None of this touches window 0, which the OS executes from, so it is safe
-//! to run beside the stock OS. Window 1's registers are restored afterwards.
+//! to run beside the stock OS. GPIO0 and window 1 are restored afterwards.
 //!
 //! The third page tests OS support (ext-flash firmware): cart.ext_flash()
 //! and a write self-test of the last cart-area sector through the OS
@@ -151,8 +151,17 @@ fn readCs1(offset: usize, dst: []u8) void {
 }
 
 fn probe() void {
+    // Restore window 1 and GPIO0 afterwards: on ext-flash firmware the OS
+    // owns both. A USB write to the drive mid-probe resets window 1 and can
+    // spoil the readings; run it again if they look odd.
     const saved_m1 = [3]u32{ reg(M1_TIMING).*, reg(M1_RFMT).*, reg(M1_RCMD).* };
-    defer setWindow1Raw(saved_m1);
+    const saved_pad = reg(PADS_BANK0_GPIO0).*;
+    const saved_ctrl = reg(IO_BANK0_GPIO0_CTRL).*;
+    defer {
+        setWindow1Raw(saved_m1);
+        reg(IO_BANK0_GPIO0_CTRL).* = saved_ctrl;
+        reg(PADS_BANK0_GPIO0).* = saved_pad;
+    }
     var r: Result = .{};
     r.m0_timing = reg(M0_TIMING).*;
     r.m0_rfmt = reg(M0_RFMT).*;

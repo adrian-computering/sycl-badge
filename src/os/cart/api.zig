@@ -229,18 +229,33 @@ pub const ExtFlashStatus = enum(u24) {
     _,
 };
 
+/// The OS takes at most one 4 KB sector per request; these loop over more.
+const ext_flash_chunk: u32 = 4096;
+
 /// Erase 4 KB sectors of the cart area: offset and len are relative to
 /// ext_flash_cart_area() and multiples of 4096. Erased bytes read 0xFF.
 /// Blocks for about 45 ms per sector. Badge RAM carts only.
 pub fn ext_flash_erase(offset: u32, len: u32) ExtFlashError!void {
-    return extFlashStatus(platform.ext_flash_request(.erase, platform.ext_flash_cart_offset() + offset, 0, len));
+    const start = std.math.add(u32, platform.ext_flash_cart_offset(), offset) catch return error.OutOfRange;
+    var done: u32 = 0;
+    while (done < len) : (done += ext_flash_chunk) {
+        const n = @min(len - done, ext_flash_chunk);
+        const at = std.math.add(u32, start, done) catch return error.OutOfRange;
+        try extFlashStatus(platform.ext_flash_request(.erase, at, 0, n));
+    }
 }
 
 /// Program erased bytes of the cart area: offset (relative to
 /// ext_flash_cart_area()) and data.len are multiples of 256. Programming can
 /// only clear bits, so erase first. data must live in cart RAM.
 pub fn ext_flash_program(offset: u32, data: []const u8) ExtFlashError!void {
-    return extFlashStatus(platform.ext_flash_request(.program, platform.ext_flash_cart_offset() + offset, @intFromPtr(data.ptr), data.len));
+    const start = std.math.add(u32, platform.ext_flash_cart_offset(), offset) catch return error.OutOfRange;
+    var done: u32 = 0;
+    while (done < data.len) : (done += ext_flash_chunk) {
+        const n: u32 = @intCast(@min(data.len - done, ext_flash_chunk));
+        const at = std.math.add(u32, start, done) catch return error.OutOfRange;
+        try extFlashStatus(platform.ext_flash_request(.program, at, @intFromPtr(data.ptr) + done, n));
+    }
 }
 
 fn extFlashStatus(status: ExtFlashStatus) ExtFlashError!void {

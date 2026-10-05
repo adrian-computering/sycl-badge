@@ -1,8 +1,9 @@
 # Cart saves: plan
 
-Branch `cart-saves` of /home/exedev/sycl-badge, off upstream main 5955625. Local only,
-not for upstream. Cart-side work lives on a branch of the snouty-badge monorepo and is
-NOT merged to its main while it needs this OS (Adrian, 2026-10-05).
+Design of the fork feature `feature/cart-saves` (authored on branch `cart-saves`, off
+upstream main 5955625; user docs in [CART_SAVES.md](CART_SAVES.md)). Not planned for
+upstream. Cart-side work lives on a branch of the snouty-badge monorepo and is not
+merged to its main while it needs this OS (Adrian, 2026-10-05).
 
 Goal: carts store small blobs (emulator battery RAM, game progress, high scores) that
 survive cart switches, power-off and OS updates, on badges running this OS, and degrade

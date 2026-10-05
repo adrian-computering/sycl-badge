@@ -1,7 +1,7 @@
 //! Cart save store: small key -> blob store in a 256 KB internal-flash region.
 //!
 //! Pure logic over a `Flash` interface (no hardware imports), so the OS, the simulator
-//! and badge-bench can share it. Format and rules are in SAVES_PLAN.md ("Store format").
+//! and badge-bench can share it. Format and rules are in fork/CART_SAVES_PLAN.md ("Store format").
 //!
 //! Region layout (64 x 4 KB blocks, offsets relative to the region start):
 //!   block 0, 1   directory copies A and B (the valid one with the newer seq wins)

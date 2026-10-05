@@ -4,7 +4,7 @@ Carts can store small named blobs (high scores, progress, emulator battery RAM) 
 survive cart switches, power-off and OS updates. They live in the badge's internal
 flash, in the 256 KB that used to be the XIP cart window (0x101C0000..0x10200000),
 invisible to the USB drive. On stock firmware the calls report "unsupported", so a cart
-can fall back to "no saves". The full design is in [SAVES_PLAN.md](SAVES_PLAN.md).
+can fall back to "no saves". The full design is in [CART_SAVES_PLAN.md](CART_SAVES_PLAN.md).
 
 XIP (execute-from-flash) carts are gone with this: the loader refuses a UF2 with
 blocks for flash addresses ("XIP not supported" in the menu). RAM carts, which is what

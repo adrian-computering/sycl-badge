@@ -1,4 +1,4 @@
-//! save-test: exercises the cart save ABI (SAVES.md).
+//! save-test: exercises the cart save ABI (fork/CART_SAVES.md).
 //!
 //! - Boot counter ("save-test/boot") that survives power-off.
 //! - Write 1 KB / 32 KB / 64 KB patterned blobs and show the elapsed ms.

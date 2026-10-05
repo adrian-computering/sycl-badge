@@ -872,9 +872,9 @@ pub inline fn write_flash_page(page: u16, src: [flash_page_size]u8) void {
 // └───────────────────────────────────────────────────────────────────────────┘
 //
 // Small named blobs (high scores, progress, battery RAM) that survive cart
-// switches, power-off and OS updates. Needs an OS with cart saves (ABI v1, see
-// SAVES.md); on stock firmware save_supported() is false and every call returns
-// error.Unsupported, so carts can fall back to "no saves".
+// switches, power-off and OS updates. Needs an OS with cart saves (ABI v1,
+// see fork/CART_SAVES.md); on stock firmware save_supported() is false and
+// every call returns error.Unsupported, so carts can fall back to "no saves".
 //
 // Keys are 1..32 bytes of printable ASCII (0x20..0x7E), e.g. "mygame/slot1".
 // A write is atomic: after a power cut the key holds the old or the new blob,

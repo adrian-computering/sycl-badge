@@ -13,7 +13,7 @@
 //! flash_exit_xip and the restore touches XIP.
 //!
 //! Core 1 must not touch XIP while an operation runs (carts are RAM carts and
-//! mask their interrupts while they wait on a save; see SAVES.md).
+//! mask their interrupts while they wait on a save; see fork/CART_SAVES.md).
 const std = @import("std");
 const microzig = @import("microzig");
 const rom_api = microzig.hal.rom;

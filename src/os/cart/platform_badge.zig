@@ -533,7 +533,7 @@ pub noinline fn outline_zone_end(time: i64, record_block: bool) void {
 
 // ┌───────────────────────────────────────────────────────────────────────────┐
 // │                                                                           │
-// │ Cart Saves (ABI v1, see os_abi.zig and SAVES.md)                          │
+// │ Cart Saves (ABI v1, see os_abi.zig and fork/CART_SAVES.md)                │
 // │                                                                           │
 // └───────────────────────────────────────────────────────────────────────────┘
 

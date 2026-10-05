@@ -123,7 +123,7 @@ pub const CART_SAVE_REQ        : u8 = 0x2C;
 // zig fmt: on
 
 // ┌───────────────────────────────────────────────────────────────────────────┐
-// │ Cart saves, ABI v1 (frozen, see SAVES_PLAN.md / SAVES.md)                 │
+// │ Cart saves, ABI v1 (frozen; fork/CART_SAVES.md, fork/CART_SAVES_PLAN.md)  │
 // └───────────────────────────────────────────────────────────────────────────┘
 
 pub const SAVE_MAGIC: u32 = 0x31564153; // "SAV1"

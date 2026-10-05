@@ -14,9 +14,9 @@ set -euo pipefail
 FEATURES=(
   feature/usb-console
   feature/cart-serial:feature/usb-console
+  feature/net-lobby:feature/cart-serial
 )
 IN_PROGRESS=(
-  feature/net-lobby:feature/cart-serial
 )
 
 ZIG="${ZIG:-zig}"
@@ -90,7 +90,7 @@ merge_into() { # merge_into <branch> <source>; sets $dir; returns 1 if nothing t
 }
 
 branches=()
-for entry in "${FEATURES[@]}" "${IN_PROGRESS[@]}"; do
+for entry in "${FEATURES[@]}" ${IN_PROGRESS[@]+"${IN_PROGRESS[@]}"}; do
   branch="${entry%%:*}"
   base="${entry#*:}"
   [[ "$base" == "$entry" ]] && base=upstream/main

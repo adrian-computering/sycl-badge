@@ -12,7 +12,7 @@ fork features detect stock firmware at run time and degrade gracefully.
 |---|---|---|---|
 | USB serial console (restores the console and `cart.trace()` output over USB, lost in upstream #136) | `feature/usb-console` | merged | below |
 | Cart serial port and multiplayer lobby (`cart.serial`, `cart.lobby`, `badge lobby`) | `feature/cart-serial` | merged (untested on hardware) | [fork/CART_SERIAL.md](fork/CART_SERIAL.md) |
-| Network lobby (`badge lobby --listen/--tailcat`, `badge join`: badges on different laptops share a lobby over a LAN or the internet via [tailcat](https://github.com/tailscale/tailcat)) | `feature/net-lobby` (on `feature/cart-serial`) | in progress | [fork/NET_LOBBY.md](fork/NET_LOBBY.md) |
+| Network lobby (`badge lobby --listen/--tailcat`, `badge join`: badges on different laptops share a lobby over a LAN or the internet via [tailcat](https://github.com/tailscale/tailcat)) | `feature/net-lobby` (on `feature/cart-serial`) | merged (simulator-tested through real tailcat; untested on hardware) | [fork/NET_LOBBY.md](fork/NET_LOBBY.md) |
 
 The USB console comes from Carl Sverre's upstream PRs #159 and #160, merged
 as-is so upstream can tell them apart.

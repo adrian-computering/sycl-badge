@@ -375,6 +375,11 @@ pub fn stop_buffered() void {
     stop();
 }
 
+/// True while the cart's buffered (streaming) audio is playing.
+pub fn is_buffered_running() bool {
+    return sound_type.state == .sample;
+}
+
 /// Start a continuous tone at `freq_hz`.
 /// Passing 0 is equivalent to calling `stop()`.
 /// The speaker enable pin is asserted automatically.

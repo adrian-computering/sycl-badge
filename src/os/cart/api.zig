@@ -867,6 +867,131 @@ pub inline fn write_flash_page(page: u16, src: [flash_page_size]u8) void {
 
 // ┌───────────────────────────────────────────────────────────────────────────┐
 // │                                                                           │
+// │ Cart Saves                                                                │
+// │                                                                           │
+// └───────────────────────────────────────────────────────────────────────────┘
+//
+// Small named blobs (high scores, progress, battery RAM) that survive cart
+// switches, power-off and OS updates. Needs an OS with cart saves (ABI v1, see
+// SAVES.md); on stock firmware save_supported() is false and every call returns
+// error.Unsupported, so carts can fall back to "no saves".
+//
+// Keys are 1..32 bytes of printable ASCII (0x20..0x7E), e.g. "mygame/slot1".
+// A write is atomic: after a power cut the key holds the old or the new blob,
+// never a mix. Writes and deletes block the cart (about 0.1 s for 1 KB, 0.5 s
+// for 32 KB) and are rate limited (8 in a burst, then 1 per 10 s), so save on
+// events (level end, menu, exit request), not every frame.
+
+const os_abi = @import("os_abi.zig");
+
+pub const SaveStat = os_abi.SaveStat;
+pub const SaveListEntry = os_abi.SaveListEntry;
+pub const save_max_blob: u32 = 64 * 1024;
+pub const save_max_key: u32 = 32;
+pub const save_max_entries: u32 = 63;
+
+pub const SaveError = error{
+    /// The OS has no cart saves (stock firmware).
+    Unsupported,
+    /// No blob under that key.
+    NotFound,
+    /// Not enough free blocks or directory entries for this blob.
+    NoSpace,
+    /// Bad key (empty, longer than 32 bytes, or not printable ASCII) or length.
+    BadRequest,
+    /// The buffer is not in cart RAM (or misaligned).
+    BadBuffer,
+    /// Too many writes in a short time; try again in a few seconds.
+    RateLimited,
+    /// Blob longer than save_max_blob.
+    TooBig,
+    /// Flash error or corrupt blob (a corrupt blob can be rewritten).
+    IoError,
+    /// Another save request is in flight.
+    Busy,
+};
+
+/// Whether the OS supports cart saves. The first call probes the OS (up to
+/// 250 ms on stock firmware); the answer is cached for the rest of the boot.
+pub fn save_supported() bool {
+    return platform.save_supported();
+}
+
+fn save_call(op: os_abi.SaveOp, key: []const u8, buf: ?[*]u8, len: usize) SaveError!u32 {
+    if (!save_supported()) return error.Unsupported;
+    if (key.len > save_max_key) return error.BadRequest;
+    if (len > std.math.maxInt(u32)) return error.TooBig;
+    var result: u32 = 0;
+    return switch (platform.save_transact(op, key, buf, @intCast(len), &result)) {
+        .ok => result,
+        .not_found => error.NotFound,
+        .no_space => error.NoSpace,
+        .bad_request => error.BadRequest,
+        .bad_buffer => error.BadBuffer,
+        .rate_limited => error.RateLimited,
+        .too_big => error.TooBig,
+        .busy => error.Busy,
+        else => error.IoError,
+    };
+}
+
+/// Copies up to dst.len bytes of the blob into dst and returns the blob's full
+/// size (larger than dst.len means dst got only the first dst.len bytes).
+/// Pass an empty dst to just ask for the size.
+pub fn save_read(key: []const u8, dst: []u8) SaveError!usize {
+    return try save_call(.read, key, dst.ptr, dst.len);
+}
+
+/// Stores src (1..save_max_blob bytes) under key, replacing any old blob,
+/// atomically. Writing the bytes already stored costs nothing.
+pub fn save_write(key: []const u8, src: []const u8) SaveError!void {
+    _ = try save_call(.write, key, @constCast(src.ptr), src.len);
+}
+
+/// Removes key (error.NotFound if it isn't there).
+pub fn save_delete(key: []const u8) SaveError!void {
+    _ = try save_call(.delete, key, null, 0);
+}
+
+/// Store usage: free bytes for a new blob, entries, writes allowed right now.
+pub fn save_stat() SaveError!SaveStat {
+    var st: SaveStat align(4) = undefined;
+    _ = try save_call(.stat, &.{}, @ptrCast(&st), @sizeOf(SaveStat));
+    return st;
+}
+
+/// Fills out with up to out.len entries and returns how many were written.
+pub fn save_list(out: []SaveListEntry) SaveError!usize {
+    if (out.len == 0) return 0;
+    return try save_call(.list, &.{}, @ptrCast(out.ptr), out.len * @sizeOf(SaveListEntry));
+}
+
+/// 0 = nothing, 1 = the player chose "Exit cart" (set by the OS), 2 = the
+/// cart is done saving (set by exit_ready()).
+var exit_word: u32 align(4) = 0;
+
+/// Ask the OS to tell this cart when the player exits it from the settings
+/// menu: the OS then sets exit_requested(), keeps the cart running for up to
+/// 3 s so it can save, and stops it when the cart calls exit_ready().
+/// (The simulator has no exit menu, so exit_requested() stays false there.)
+pub fn save_watch_exit() SaveError!void {
+    @as(*volatile u32, &exit_word).* = 0;
+    _ = try save_call(.exit_watch, &.{}, @ptrCast(&exit_word), @sizeOf(u32));
+}
+
+/// True once the player asked to exit (after save_watch_exit()). Check it once
+/// a frame; save, then call exit_ready().
+pub fn exit_requested() bool {
+    return @as(*const volatile u32, &exit_word).* == os_abi.EXIT_WORD_REQUESTED;
+}
+
+/// Tell the OS this cart finished saving and may be stopped now.
+pub fn exit_ready() void {
+    @as(*volatile u32, &exit_word).* = os_abi.EXIT_WORD_READY;
+}
+
+// ┌───────────────────────────────────────────────────────────────────────────┐
+// │                                                                           │
 // │ Profiling Functions                                                       │
 // │                                                                           │
 // └───────────────────────────────────────────────────────────────────────────┘

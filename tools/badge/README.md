@@ -92,6 +92,16 @@ Lines you type are sent to the cart (`--eol lf|cr|crlf|none`, default `lf`).
   `pong 7`, `error 3 text`, `raw 83 01 41`, and the cart-side
   `hello GAME NAME [MAX]`, `send TO|all TEXT`, `ping [TOKEN]`, `leave`.
 
+### `badge echo-test [BADGE] [--rate HZ] [--size BYTES] [--seconds S]`
+
+Measures the cart serial path. Run the `serial-echo` cart, then this sends
+timestamped records (default 16 bytes at 60 Hz for 10 s) and reports how
+many came back, in order, and the round trip p50 / p99 / max. One direction
+is about half the round trip, so badge -> `badge lobby` -> badge costs about
+one round trip plus the relay. The echo cart answers once per frame, so the
+round trip includes up to one cart frame, as a game polling once per frame
+would see. `--rate 1000 --size 64` checks throughput.
+
 ### `badge flash FIRMWARE.uf2 [BADGE ...] [--all]`
 
 Flashes OS firmware. For each badge, one at a time:

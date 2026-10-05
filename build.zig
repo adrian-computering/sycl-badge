@@ -167,6 +167,13 @@ pub fn build(b: *Build) void {
             .optimize = .Debug,
         }),
     });
+    // The USB code under test imports microzig for its descriptor types
+    unit_tests.root_module.addImport("microzig", b.createModule(.{
+        .root_source_file = b.path("src/os/tests/microzig_host.zig"),
+        .imports = &.{.{ .name = "mz_core", .module = b.createModule(.{
+            .root_source_file = mz_dep.builder.dependency("core", .{}).path("src/core.zig"),
+        }) }},
+    }));
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 

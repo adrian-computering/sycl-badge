@@ -1,8 +1,29 @@
 //! USB device driver
 //!
-//! The badge is a composite device: mass storage on interface 0 (EP1) for the
-//! cart drive, and a CDC ACM serial port on interfaces 1 and 2 (EP2 data, EP3
-//! notifications) for the kernel console.
+//! The badge is a composite device (descriptors in usb/descriptors.zig): mass
+//! storage on interface 0 for the cart drive, and two CDC ACM serial ports,
+//! the kernel console on interfaces 1-2 and the running cart's serial port on
+//! interfaces 3-4 (serviced by system/cart_serial.zig).
+//!
+//! Endpoints and their DPRAM buffers. Every buffer is single buffered and holds
+//! one 64 byte packet; the controller requires 64 byte aligned buffers above
+//! the 0x100 byte register area.
+//!
+//! | Endpoint | Type      | Use                          | DPRAM offset |
+//! |----------|-----------|------------------------------|--------------|
+//! | EP0 IN   | control   | setup requests (shared)      | 0x100        |
+//! | EP0 OUT  | control   | setup requests (shared)      | 0x100        |
+//! | EP1 IN   | bulk      | mass storage                 | 0x180        |
+//! | EP1 OUT  | bulk      | mass storage                 | 0x1C0        |
+//! | EP2 IN   | bulk      | console data                 | 0x200        |
+//! | EP2 OUT  | bulk      | console data                 | 0x240        |
+//! | EP3 IN   | interrupt | console notifications        | 0x280        |
+//! | EP4 IN   | bulk      | cart serial data             | 0x2C0        |
+//! | EP4 OUT  | bulk      | cart serial data             | 0x300        |
+//! | EP5 IN   | interrupt | cart serial notifications    | 0x340        |
+//!
+//! 0x380-0xFFF is free. The notification endpoints are enabled so the
+//! controller answers the host's polls with NAK, but never armed.
 const std = @import("std");
 const microzig = @import("microzig");
 const assert = microzig.assert;
@@ -20,30 +41,32 @@ const EndpointControl = @FieldType(microzig.chip.types.peripherals.USB_DPRAM, "E
 
 const setup = @import("usb/setup.zig");
 const cdc = @import("usb/cdc.zig");
+const usb_descriptors = @import("usb/descriptors.zig");
 const timer = @import("timer.zig");
 const endpoint = @import("usb/endpoint.zig");
+const rom = @import("rom.zig");
 
 const log = std.log.scoped(.usb_device);
 
-const max_packet_size = 64;
+const max_packet_size = usb_descriptors.max_packet_size;
 const dpram_addr = @intFromPtr(USB_DPRAM);
 const dpram_size = 4096;
 const ep_ctrls: *volatile [32]EndpointControl = @ptrFromInt(dpram_addr + 0x00);
 const buff_ctrls: *volatile [32]BufferControl = @ptrFromInt(dpram_addr + 0x80);
 
-// DPRAM data buffers. The hardware fixes the EP0 buffer at 0x100 and shares it
-// between both directions. Every other buffer holds one packet.
+// DPRAM data buffers, see the table at the top. The hardware fixes the EP0
+// buffer at 0x100 and shares it between both directions.
 const ep0_buffer = 0x100;
 const msc_in_buffer = 0x180;
 const msc_out_buffer = 0x1C0;
-const cdc_in_buffer = 0x200;
-const cdc_out_buffer = 0x240;
-const cdc_notification_buffer = 0x280;
+const console_in_buffer = 0x200;
+const console_out_buffer = 0x240;
+const console_notification_buffer = 0x280;
+const cart_in_buffer = 0x2C0;
+const cart_out_buffer = 0x300;
+const cart_notification_buffer = 0x340;
 
-// Interface numbers, class requests carry them in wIndex
-const msc_interface_num = 0;
-const cdc_comm_interface_num = 1;
-const cdc_data_interface_num = 2;
+const msc_interface_num = usb_descriptors.msc_interface;
 
 fn ep_idx(ep: Endpoint) usize {
     return (2 * @backingInt(ep.num)) + @as(usize, switch (ep.dir) {
@@ -67,118 +90,13 @@ fn clear_dpram() void {
     @memset(dpram, 0);
 }
 
-const descriptors: setup.Descriptors = blk: {
-    var builder: setup.StringDescriptorBuilder(&.{.english}) = .init();
+/// The serial number string descriptor: the chip id as 16 hex digits,
+/// filled in by `init`
+var serial_string: [2 + 2 * usb_descriptors.serial_len]u8 = undefined;
+var chip_id_hex: [usb_descriptors.serial_len]u8 = undefined;
 
-    const manufacturer = builder.add_single("Zig Embedded Group");
-    const product = builder.add_single("SYCL Badge V2");
-    const serial = builder.add_single("serial number");
-    const config_name = builder.add_single("default");
-    const msc_name = builder.add_single("SYCL Badge Cart Storage");
-    const cdc_name = builder.add_single("SYCL Badge Console");
-
-    const device = descriptor.Device{
-        .bcd_usb = .v2_00,
-        // Composite device with an interface association descriptor
-        .device_triple = .{ .class = .Miscellaneous, .subclass = 0x02, .protocol = 0x01 },
-        .max_packet_size0 = max_packet_size,
-        .vendor = .from(1234),
-        .product = .from(1234),
-        // Badge V2
-        .bcd_device = .from(2, 0),
-        .manufacturer_s = manufacturer,
-        .product_s = product,
-        .serial_s = serial,
-        // rarely ever more than one
-        .num_configurations = 1,
-    };
-
-    const const_builder = builder.finish();
-
-    // Interface 0: mass storage for carts
-    const msc_interface = descriptor.Interface{
-        .interface_number = msc_interface_num,
-        .alternate_setting = 0,
-        .num_endpoints = 2,
-        .interface_triple = .from(.MassStorage, .SCSI, .BulkOnly),
-        .interface_s = msc_name,
-    };
-    const msc_in_ep: descriptor.Endpoint = .bulk(.{ .dir = .in, .num = .ep1 }, max_packet_size);
-    const msc_out_ep: descriptor.Endpoint = .bulk(.{ .dir = .out, .num = .ep1 }, max_packet_size);
-
-    // Interfaces 1 and 2: CDC ACM serial console
-    const cdc_association = descriptor.InterfaceAssociation{
-        .first_interface = cdc_comm_interface_num,
-        .interface_count = 2,
-        .function_class = @backingInt(types.ClassSubclassProtocol.ClassCode.CDC),
-        .function_subclass = @backingInt(types.ClassSubclassProtocol.Subclass.CDC.Abstract),
-        .function_protocol = @backingInt(types.ClassSubclassProtocol.Protocol.CDC.NoneRequired),
-        .function = cdc_name,
-    };
-    const cdc_comm_interface = descriptor.Interface{
-        .interface_number = cdc_comm_interface_num,
-        .alternate_setting = 0,
-        .num_endpoints = 1,
-        .interface_triple = .from(.CDC, .Abstract, .NoneRequired),
-        .interface_s = cdc_name,
-    };
-    const cdc_header = descriptor.cdc.Header{};
-    const cdc_call_management = descriptor.cdc.CallManagement{
-        .capabilities = .none,
-        .data_interface = cdc_data_interface_num,
-    };
-    const cdc_acm = descriptor.cdc.AbstractControlModel{
-        .capabilities = .{
-            .comm_feature = false,
-            .line_coding = true,
-            .send_break = false,
-            .network_connection = false,
-        },
-    };
-    const cdc_union = descriptor.cdc.Union{
-        .master_interface = cdc_comm_interface_num,
-        .slave_interface_0 = cdc_data_interface_num,
-    };
-    const cdc_notification_ep: descriptor.Endpoint = .interrupt(.{ .dir = .in, .num = .ep3 }, 8, 16);
-    const cdc_data_interface = descriptor.Interface{
-        .interface_number = cdc_data_interface_num,
-        .alternate_setting = 0,
-        .num_endpoints = 2,
-        .interface_triple = .{ .class = .CDC_Data, .subclass = 0x00, .protocol = 0x00 },
-        .interface_s = cdc_name,
-    };
-    const cdc_in_ep: descriptor.Endpoint = .bulk(.{ .dir = .in, .num = .ep2 }, max_packet_size);
-    const cdc_out_ep: descriptor.Endpoint = .bulk(.{ .dir = .out, .num = .ep2 }, max_packet_size);
-
-    const function_descriptors = std.mem.asBytes(&msc_interface) ++
-        std.mem.asBytes(&msc_in_ep) ++
-        std.mem.asBytes(&msc_out_ep) ++
-        std.mem.asBytes(&cdc_association) ++
-        std.mem.asBytes(&cdc_comm_interface) ++
-        std.mem.asBytes(&cdc_header) ++
-        std.mem.asBytes(&cdc_call_management) ++
-        std.mem.asBytes(&cdc_acm) ++
-        std.mem.asBytes(&cdc_union) ++
-        std.mem.asBytes(&cdc_notification_ep) ++
-        std.mem.asBytes(&cdc_data_interface) ++
-        std.mem.asBytes(&cdc_in_ep) ++
-        std.mem.asBytes(&cdc_out_ep);
-
-    const config = descriptor.Configuration{
-        .total_length = .from(@sizeOf(descriptor.Configuration) + function_descriptors.len),
-        .num_interfaces = 3,
-        .configuration_value = 1,
-        .configuration_s = config_name,
-        .attributes = .{ .self_powered = false },
-        .max_current = .from_ma(350),
-    };
-
-    const config_payload = std.mem.asBytes(&config) ++ function_descriptors;
-    break :blk setup.Descriptors{
-        .device = &device,
-        .string = const_builder.to_descriptor(),
-        .configurations = &.{config_payload},
-    };
+const runtime_strings = [_]setup.Descriptors.RuntimeString{
+    .{ .index = usb_descriptors.strings.serial, .payload = &serial_string },
 };
 
 const SetupProcessor = setup.RequestPacketProcessor(.{
@@ -213,27 +131,72 @@ const MSC_Driver = @import("usb/msc.zig").MSC_Driver(SetupProcessor, .{
     },
 });
 
-const CDC_Driver = cdc.CDC_Driver(SetupProcessor, .{
+/// The callbacks of a CDC port whose bulk endpoints are `ep_num` IN and OUT
+fn CdcEndpoints(comptime ep_num: Endpoint.Num, comptime in_buffer: u16, comptime out_buffer: u16) type {
+    return struct {
+        fn send_packet(data: []const u8, pid: endpoint.PacketIdentifier) void {
+            queue_in_packet(ep_num, in_buffer, data, pid);
+        }
+
+        fn arm(pid: endpoint.PacketIdentifier) void {
+            queue_out_packet(ep_num, pid);
+        }
+
+        fn received() []const u8 {
+            return received_packet(ep_num, out_buffer);
+        }
+
+        fn disarm(dir: types.Dir) void {
+            switch (dir) {
+                inline else => |d| {
+                    disarm_endpoint(.{ .dir = d, .num = ep_num });
+                    // drop an abandoned buffer
+                    var status: @TypeOf(USB.BUFF_STATUS.read()) = .{};
+                    @field(status, std.fmt.comptimePrint("EP{d}_{s}", .{
+                        @backingInt(ep_num),
+                        switch (d) {
+                            .in => "IN",
+                            .out => "OUT",
+                        },
+                    })) = 1;
+                    rp2xxx.hw.clear_alias(&USB.BUFF_STATUS).write(status);
+                },
+            }
+        }
+
+        const callbacks: cdc.Callbacks = .{
+            .queue_packet = send_packet,
+            .queue_receive = arm,
+            .get_buffer = received,
+            .disarm_endpoint = disarm,
+        };
+    };
+}
+
+const ConsoleDriver = cdc.CDC_Driver(SetupProcessor, .{
     .max_packet_size = max_packet_size,
-    .callbacks = .{
-        .queue_packet = cdc_queue_packet,
-        .queue_receive = cdc_queue_receive,
-        .get_buffer = cdc_get_buffer,
-        .disarm_endpoints = cdc_disarm_endpoints,
-    },
+    .callbacks = CdcEndpoints(.ep2, console_in_buffer, console_out_buffer).callbacks,
+});
+
+pub const CartDriver = cdc.CDC_Driver(SetupProcessor, .{
+    .max_packet_size = max_packet_size,
+    .callbacks = CdcEndpoints(.ep4, cart_in_buffer, cart_out_buffer).callbacks,
 });
 
 var setup_processor: SetupProcessor = undefined;
 var msc_driver: MSC_Driver = undefined;
-var cdc_driver: CDC_Driver = undefined;
+var console: cdc.Buffered(ConsoleDriver, 1024, 256) = undefined;
+var cart_driver: CartDriver = undefined;
 
 /// True while `poll` runs, `send` and `receive` must not re-enter it
 var in_poll = false;
 
 /// Initialize the USB device
-/// Sets up the USB in device mode with mass storage and a CDC serial console
+/// Sets up the USB in device mode with mass storage and two CDC serial ports
 /// Returns error if initialization fails
 pub fn init() !void {
+    build_serial_string();
+
     log.info("Resetting USBCTRL", .{});
     rp2xxx.resets.reset(.only(.usbctrl));
 
@@ -272,19 +235,24 @@ pub fn init() !void {
     });
 
     msc_driver.init(null);
-    cdc_driver.init();
+    console.init();
+    cart_driver.init();
+    var descriptors = usb_descriptors.descriptors;
+    descriptors.runtime_strings = &runtime_strings;
     setup_processor = .init(.{
         .descriptors = descriptors,
         .handlers = .{
             .interface = &.{
                 .{ .num = msc_interface_num, .ctx = &msc_driver, .handler = MSC_Driver.setup_handler },
-                .{ .num = cdc_comm_interface_num, .ctx = &cdc_driver, .handler = CDC_Driver.setup_handler },
+                .{ .num = usb_descriptors.console_interface, .ctx = &console.port, .handler = ConsoleDriver.setup_handler },
+                .{ .num = usb_descriptors.cart_interface, .ctx = &cart_driver, .handler = CartDriver.setup_handler },
             },
         },
     });
 
     setup_endpoints();
-    cdc_driver.reset();
+    console.reset();
+    cart_driver.reset();
 
     connect();
     msc_driver.in_ready();
@@ -322,7 +290,8 @@ fn stall(ep: types.Endpoint) void {
 fn clear_endpoint_halt(ep: types.Endpoint) void {
     switch (ep.num) {
         .ep1 => msc_driver.reset(),
-        .ep2 => cdc_driver.reset(),
+        .ep2 => console.port.clear_halt(ep.dir),
+        .ep4 => cart_driver.clear_halt(ep.dir),
         else => {},
     }
 }
@@ -330,7 +299,7 @@ fn clear_endpoint_halt(ep: types.Endpoint) void {
 /// Aborts the transfer armed on `ep` so its buffer can be written again
 fn abort_endpoint(ep: Endpoint) void {
     switch (ep.num) {
-        inline .ep1, .ep2, .ep3 => |num| switch (ep.dir) {
+        inline .ep1, .ep2, .ep3, .ep4, .ep5 => |num| switch (ep.dir) {
             inline .in, .out => |dir| {
                 const field = comptime std.fmt.comptimePrint("EP{d}_{s}", .{
                     @backingInt(num),
@@ -379,14 +348,6 @@ fn msc_disarm_endpoints() void {
 
     // drop abandoned buffers
     rp2xxx.hw.clear_alias(&USB.BUFF_STATUS).write(.{ .EP1_IN = 1, .EP1_OUT = 1 });
-}
-
-fn cdc_disarm_endpoints() void {
-    disarm_endpoint(.{ .dir = .in, .num = .ep2 });
-    disarm_endpoint(.{ .dir = .out, .num = .ep2 });
-
-    // drop abandoned buffers
-    rp2xxx.hw.clear_alias(&USB.BUFF_STATUS).write(.{ .EP2_IN = 1, .EP2_OUT = 1 });
 }
 
 /// The buffer control register needs a few cycles between writing the packet
@@ -519,20 +480,6 @@ fn msc_queue_receive(pid: endpoint.PacketIdentifier) void {
     queue_out_packet(.ep1, pid);
 }
 
-fn cdc_queue_packet(data: []const u8, pid: endpoint.PacketIdentifier) void {
-    log.debug("queue_cdc_packet: len={} pid={}", .{ data.len, pid });
-    queue_in_packet(.ep2, cdc_in_buffer, data, pid);
-}
-
-fn cdc_get_buffer() []const u8 {
-    return received_packet(.ep2, cdc_out_buffer);
-}
-
-fn cdc_queue_receive(pid: endpoint.PacketIdentifier) void {
-    log.debug("queue_cdc_receive: pid={}", .{pid});
-    queue_out_packet(.ep2, pid);
-}
-
 fn configure_endpoint(ep: Endpoint, ep_type: EndpointType, buffer_offset: u16) void {
     endpoint_control(ep).write(.{
         .BUFFER_ADDRESS = buffer_offset,
@@ -549,13 +496,18 @@ fn setup_endpoints() void {
     configure_endpoint(.{ .num = .ep1, .dir = .out }, .bulk, msc_out_buffer);
     msc_queue_receive(.DATA0);
 
-    // EP2 IN and OUT: CDC data, the CDC driver arms the OUT side in reset
-    configure_endpoint(.{ .num = .ep2, .dir = .in }, .bulk, cdc_in_buffer);
-    configure_endpoint(.{ .num = .ep2, .dir = .out }, .bulk, cdc_out_buffer);
+    // EP2 IN and OUT: console data, the CDC driver arms the OUT side in reset
+    configure_endpoint(.{ .num = .ep2, .dir = .in }, .bulk, console_in_buffer);
+    configure_endpoint(.{ .num = .ep2, .dir = .out }, .bulk, console_out_buffer);
 
-    // EP3 IN: CDC notifications. Enabled so the controller answers the host's
-    // polls with NAK, but never armed: the console has nothing to notify.
-    configure_endpoint(.{ .num = .ep3, .dir = .in }, .interrupt, cdc_notification_buffer);
+    // EP3 IN: console notifications. Enabled so the controller answers the
+    // host's polls with NAK, but never armed: there is nothing to notify.
+    configure_endpoint(.{ .num = .ep3, .dir = .in }, .interrupt, console_notification_buffer);
+
+    // EP4 and EP5: the same for the cart serial port
+    configure_endpoint(.{ .num = .ep4, .dir = .in }, .bulk, cart_in_buffer);
+    configure_endpoint(.{ .num = .ep4, .dir = .out }, .bulk, cart_out_buffer);
+    configure_endpoint(.{ .num = .ep5, .dir = .in }, .interrupt, cart_notification_buffer);
 }
 
 pub fn poll() void {
@@ -570,7 +522,8 @@ pub fn poll() void {
         USB.ADDR_ENDP.write(.{ .ADDRESS = 0 });
 
         msc_driver.reset();
-        cdc_driver.reset();
+        console.reset();
+        cart_driver.reset();
 
         // TODO: use clear alias?
         USB.SIE_STATUS.write(.{ .BUS_RESET = 1 });
@@ -608,13 +561,23 @@ pub fn poll() void {
         }
 
         if (buff_status.EP2_IN == 1) {
-            cdc_driver.in_ready();
+            console.port.in_ready();
             clear.write(.{ .EP2_IN = 1 });
         }
 
         if (buff_status.EP2_OUT == 1) {
-            cdc_driver.out_ready();
+            console.port.out_ready();
             clear.write(.{ .EP2_OUT = 1 });
+        }
+
+        if (buff_status.EP4_IN == 1) {
+            cart_driver.in_ready();
+            clear.write(.{ .EP4_IN = 1 });
+        }
+
+        if (buff_status.EP4_OUT == 1) {
+            cart_driver.out_ready();
+            clear.write(.{ .EP4_OUT = 1 });
         }
     }
 
@@ -626,9 +589,33 @@ pub fn poll() void {
         setup_processor.submit_setup_request(pkt.*);
     }
 
+    // Without start of frame packets the host is asleep or the cable is gone
+    // (VBUS detection is forced on, so unplugging looks like a suspend): treat
+    // both serial ports as closed so writers do not wait for a reader
+    const suspended = !bus_active();
+    console.port.bus_suspended = suspended;
+    cart_driver.bus_suspended = suspended;
+
     setup_processor.poll();
     msc_driver.poll();
-    cdc_driver.poll();
+    console.poll();
+    cart_driver.poll();
+}
+
+/// The frame number of the last start of frame packet, and when it changed
+var last_frame: u11 = 0;
+var last_frame_ms: u64 = 0;
+
+/// True while the host sends a start of frame packet every millisecond. The
+/// frame number is watched rather than SIE_STATUS.SUSPENDED, a sticky flag.
+fn bus_active() bool {
+    const frame = USB.SOF_RD.read().COUNT;
+    const now = timer.millis();
+    if (frame != last_frame) {
+        last_frame = frame;
+        last_frame_ms = now;
+    }
+    return now - last_frame_ms < 20;
 }
 
 /// Sends console output to the host. Output waits in a buffer until a terminal
@@ -638,12 +625,12 @@ pub fn send(data: []const u8) bool {
     // The USB peripheral belongs to core 0
     if (SIO.CPUID.raw != 0) return false;
 
-    var rest = data[cdc_driver.write(data)..];
+    var rest = data[console.write(data)..];
     const deadline = timer.millis() + 100;
     while (rest.len > 0) {
-        if (!cdc_driver.connected() or in_poll or timer.millis() > deadline) return false;
+        if (!console.connected() or in_poll or timer.millis() > deadline) return false;
         poll();
-        rest = rest[cdc_driver.write(rest)..];
+        rest = rest[console.write(rest)..];
     }
     return true;
 }
@@ -653,9 +640,31 @@ pub fn send(data: []const u8) bool {
 pub fn receive(buffer: []u8, timeout_ms: u32) usize {
     const deadline = timer.millis() + timeout_ms;
     while (true) {
-        const n = cdc_driver.read(buffer);
+        const n = console.read(buffer);
         if (n > 0 or in_poll or timer.millis() >= deadline) return n;
         poll();
+    }
+}
+
+/// The cart serial port, for system/cart_serial.zig. Only use it from the
+/// kernel main loop, never from inside `poll`.
+pub fn cart_port() *CartDriver {
+    return &cart_driver;
+}
+
+/// The RP2350 chip id as 16 uppercase hex digits, also the USB serial number
+pub fn chip_id_string() []const u8 {
+    return &chip_id_hex;
+}
+
+fn build_serial_string() void {
+    _ = std.fmt.bufPrint(&chip_id_hex, "{X:0>16}", .{rom.chip_id()}) catch unreachable;
+    serial_string[0] = serial_string.len;
+    serial_string[1] = @backingInt(descriptor.Type.string);
+    for (chip_id_hex, 0..) |c, i| {
+        // UTF-16LE
+        serial_string[2 + 2 * i] = c;
+        serial_string[3 + 2 * i] = 0;
     }
 }
 
@@ -684,4 +693,6 @@ test {
     _ = @import("usb/setup.zig");
     _ = @import("usb/endpoint.zig");
     _ = @import("usb/cdc.zig");
+    _ = @import("usb/descriptors.zig");
+    _ = @import("usb/setup_test.zig");
 }

@@ -74,7 +74,8 @@ The badge is one composite USB device:
 
 The USB serial number is the RP2350 chip id (16 hex digits), unique per badge,
 so ports have stable names: `/dev/serial/by-id/usb-*_SYCL_Badge_V2_<id>-if03`
-on Linux, `/dev/cu.usbmodem<id>3`-style names on macOS, a COM port on Windows.
+on Linux, `/dev/cu.usbmodem*` on macOS (two per badge; console first), a COM
+port on Windows. `badge list` shows which port is which on every OS.
 The baud rate setting is ignored; the port always runs at USB speed.
 
 Behavior of the cart port:
@@ -202,4 +203,15 @@ Error codes: 1 unsupported version, 2 no room (server full), 3 not joined
   closes, or the badge disappears. The host closes the port of a badge it
   stops seeing.
 - Unknown message types are ignored by both sides, so later versions can add
-  messages without breaking v1 peers.
+  messages without breaking v1 peers. Bytes after the end of a fixed-size
+  payload are ignored too, so later versions can append fields. A host-to-cart
+  type arriving at the host counts as unknown.
+- Details of the reference host (`badge lobby`), which other hosts should
+  match:
+  - Rooms are numbered from 1, lowest free, up to 255; ERROR 2 only when all
+    255 are in use.
+  - `max_players` 0 means the host default (`--max-room`, 16); other values
+    are clamped to 2..min(16, `--max-room`).
+  - A HELLO with an unsupported version leaves the old room, then gets ERROR 1.
+  - A SEND addressed to the sender's own id is delivered to it.
+  - A SEND or DATA with more than 240 bytes of data is malformed (ERROR 4).

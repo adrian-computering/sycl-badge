@@ -34,7 +34,7 @@ instead, the way cart saves do, and gets its row below.
 |---|---|---|
 | `0x25`, `0x26`, `0x29`, `0x2A` | framebuffer, trace, audio, time | upstream |
 | `0x2B` | `EXT_FLASH_REQ` / `EXT_FLASH_DONE` | fork `feature/ext-flash` |
-| `0x2C` | `CART_SAVE_REQ` | cart saves (`cart-saves` branch) |
+| `0x2C` | `CART_SAVE_REQ` | fork `feature/cart-saves` ([CART_SAVES.md](CART_SAVES.md)) |
 
 ## Rules
 

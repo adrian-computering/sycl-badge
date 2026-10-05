@@ -24,6 +24,7 @@ const storage = @import("loader/storage.zig");
 const loader = @import("loader/loader.zig");
 const multicore = @import("system/multicore.zig");
 const terry = @import("system/terry.zig");
+const saves = @import("system/saves.zig");
 const mailbox = @import("ipc/mailbox.zig");
 const abi = @import("cart/os_abi.zig");
 const Controls = abi.Controls;
@@ -130,6 +131,10 @@ var pending_vsync_setting: ?VsyncState = null;
 
 var force_fullscreen_refresh: bool = false;
 
+/// Settings "Exit cart" asked a cart with an exit word to save; stop it once
+/// saves.exitReady() says so.
+var cart_exit_pending: bool = false;
+
 // This function uses FP registers. If inlined into microzig_main, it will save FP registers in the preamble
 // before the FP unit is initialized, causing a fault.
 pub noinline fn main() !void {
@@ -144,6 +149,9 @@ pub noinline fn main() !void {
 
     screen_wait_for.register("kernel.screen_wait_for", .cart, @src());
     cart_serial.init();
+
+    // Mount the cart save store (reads only).
+    saves.init();
 
     last_buttons = read_buttons();
 
@@ -177,6 +185,9 @@ pub noinline fn main() !void {
 
         // Process console input
         console.processInput();
+
+        // Cart saves: at most one flash step per pass.
+        saves.poll();
 
         // Check if cart is running - controls both button handling and display updates
         // Check for both .ready and .running states (cart is active from load until stop)
@@ -224,6 +235,16 @@ pub noinline fn main() !void {
             }
             fps_overlay.setEnabled(new_state);
             console.printf("[BTN] CLICK: FPS overlay {s}\r\n", .{if (new_state) "on" else "off"});
+        }
+
+        if (cart_exit_pending and (!cart_running or saves.exitReady(timer.micros()))) {
+            @branchHint(.unlikely);
+            cart_exit_pending = false;
+            settings.endSaving();
+            if (cart_running) {
+                stop_active_cart();
+                continue;
+            }
         }
 
         if (settings.isActive()) {
@@ -475,6 +496,8 @@ fn handle_cart_message(msg: u32, sync_time: *bool) void {
     } else if (mailbox.MessageType.getType(msg) == abi.EXT_FLASH_REQ) {
         const status = handle_ext_flash_request(mailbox.MessageType.getPayload(msg));
         mailbox.send((@as(u32, abi.EXT_FLASH_DONE) << 24) | @intFromEnum(status));
+    } else if (mailbox.MessageType.getType(msg) == abi.CART_SAVE_REQ) {
+        saves.onMessage(mailbox.MessageType.getPayload(msg));
     }
     // Other messages (e.g. CART_FINISHED) handled by loader state machine.
 }
@@ -527,7 +550,24 @@ pub fn stop_active_cart() void {
     reset_after_cart();
 }
 
+/// Settings "Exit cart". If the cart registered an exit word, ask it to save and
+/// return true: the main loop keeps serving its requests and stops it once it is
+/// ready (or after saves.exit_timeout_us). Otherwise stop it now and return false.
+pub fn request_cart_exit() bool {
+    if (saves.beginExit(timer.micros())) {
+        console.println("cart exit requested: waiting for the cart to save");
+        cart_exit_pending = true;
+        return true;
+    }
+    stop_active_cart();
+    return false;
+}
+
 fn reset_after_cart() void {
+    if (cart_exit_pending) {
+        cart_exit_pending = false;
+        settings.endSaving();
+    }
     console.println("[STOP] 1: halting Core 1");
     multicore.haltCore1();
     console.println("[STOP] 2: lcd.reset");
@@ -735,6 +775,7 @@ fn runSelectedCart() void {
             loader.LoadError.VersionMismatch => "Bad Cart Version",
             loader.LoadError.FlashWriteError => "Flash error",
             loader.LoadError.ReadError => "Read error",
+            loader.LoadError.XipUnsupported => "XIP not supported",
         };
         lcd.drawString(10, 50, error_msg, .red, .black, 1);
         timer.sleep_ms(2000);

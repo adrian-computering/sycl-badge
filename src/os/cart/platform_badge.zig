@@ -686,6 +686,86 @@ pub fn serial_space_available() usize {
 
 // ┌───────────────────────────────────────────────────────────────────────────┐
 // │                                                                           │
+// │ Cart Saves (ABI v1, see os_abi.zig and fork/CART_SAVES.md)                │
+// │                                                                           │
+// └───────────────────────────────────────────────────────────────────────────┘
+
+/// null = not probed yet this boot.
+var save_supported_cache: ?bool = null;
+/// The probe lives in static RAM, not on the stack: on stock firmware nothing
+/// ever answers it, and a late answer must not land in a dead stack frame.
+var save_probe_req: abi.SaveRequest = .{ .op = .probe };
+const save_probe_timeout_us: u64 = 250_000;
+/// A request the OS hasn't picked up after this long is abandoned (Busy).
+const save_pending_timeout_us: u64 = 2_000_000;
+
+pub fn save_supported() bool {
+    if (save_supported_cache) |v| return v;
+    save_probe_req = .{ .op = .probe };
+    const answered = save_wait(&save_probe_req, false, save_probe_timeout_us);
+    const ok = answered and save_probe_req.status == .ok and save_probe_req.result >= abi.SAVE_ABI_VERSION;
+    save_supported_cache = ok;
+    return ok;
+}
+
+/// One request, blocking until the OS marks it done.
+pub fn save_transact(op: abi.SaveOp, key: []const u8, buf: ?[*]u8, len: u32, result: *u32) abi.SaveStatus {
+    var req: abi.SaveRequest = .{
+        .op = op,
+        .key_len = @intCast(key.len),
+        .buf = if (buf) |b| @intFromPtr(b) else 0,
+        .len = len,
+    };
+    @memcpy(req.key[0..key.len], key);
+    // Core 0 switches XIP off while it erases/programs for a write or delete:
+    // keep this core's interrupts masked meanwhile (their vectors may be in flash).
+    if (!save_wait(&req, op == .write or op == .delete, save_pending_timeout_us)) {
+        result.* = 0;
+        return .busy;
+    }
+    result.* = req.result;
+    return req.status;
+}
+
+/// Sends the request and spins until state == done. Runs from RAM like all of a
+/// badge cart and touches no XIP address. Gives up (false, magic zeroed so a
+/// late pick-up is ignored) if the request is still `pending` (never picked up)
+/// after timeout_us; once the OS marks it busy it waits for done.
+noinline fn save_wait(req: *abi.SaveRequest, mask_irqs: bool, timeout_us: u64) bool {
+    const r: *volatile abi.SaveRequest = req;
+    r.state = .pending;
+    asm volatile ("dmb" ::: .{ .memory = true });
+
+    const primask: u32 = asm volatile ("mrs %[r], primask"
+        : [r] "=r" (-> u32),
+    );
+    if (mask_irqs) asm volatile ("cpsid i" ::: .{ .memory = true });
+    defer if (mask_irqs) asm volatile ("msr primask, %[p]"
+        :
+        : [p] "r" (primask),
+        : .{ .memory = true });
+
+    const offset: u32 = @intCast((@intFromPtr(req) - 0x20000000) >> 2);
+    fifo_send((@as(u32, abi.CART_SAVE_REQ) << 24) | offset);
+
+    const start = micros_since_boot();
+    while (true) {
+        asm volatile ("dmb" ::: .{ .memory = true });
+        const state = r.state;
+        if (state == .done) return true;
+        if (state == .pending and micros_since_boot() - start >= timeout_us) {
+            r.magic = 0;
+            asm volatile ("dmb" ::: .{ .memory = true });
+            return false;
+        }
+        // Keep the OS's FIFO replies (FRAMEBUFFER_DONE etc.) flowing so core 0
+        // never blocks on a full FIFO while serving us.
+        if (fifo_try_recv()) |msg| handle_os_message(msg);
+    }
+}
+
+// ┌───────────────────────────────────────────────────────────────────────────┐
+// │                                                                           │
 // │ Other Functions                                                           │
 // │                                                                           │
 // └───────────────────────────────────────────────────────────────────────────┘

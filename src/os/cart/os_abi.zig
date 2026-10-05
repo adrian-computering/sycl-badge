@@ -182,6 +182,10 @@ pub const SYNC_TIME_REQ_TIME   : u32 = 0x2a000003;
 pub const EXT_FLASH_REQ        : u8 = 0x2B;
 /// Reply, OS -> cart. Payload = ExtFlashStatus.
 pub const EXT_FLASH_DONE       : u8 = 0x2B;
+/// Cart save request (cart -> OS). Payload = (request address - 0x20000000) / 4.
+/// The OS answers through the SaveRequest struct only, never through the FIFO.
+/// (0x2B is EXT_FLASH_REQ, fork/EXT_FLASH.md.)
+pub const CART_SAVE_REQ        : u8 = 0x2C;
 // zig fmt: on
 
 pub const ExtFlashOp = api.ExtFlashOp;
@@ -196,6 +200,78 @@ pub const ExtFlashRequest = extern struct {
     len: u32,
 };
 
+// ┌───────────────────────────────────────────────────────────────────────────┐
+// │ Cart saves, ABI v1 (frozen; fork/CART_SAVES.md, fork/CART_SAVES_PLAN.md)  │
+// └───────────────────────────────────────────────────────────────────────────┘
+
+pub const SAVE_MAGIC: u32 = 0x31564153; // "SAV1"
+pub const SAVE_ABI_VERSION: u32 = 1;
+
+/// Lives in cart RAM, 4-byte aligned, 64 bytes.
+pub const SaveRequest = extern struct {
+    magic: u32 = SAVE_MAGIC,
+    op: SaveOp,
+    state: SaveState = .idle,
+    status: SaveStatus = .ok, // written by the OS
+    key_len: u32 = 0, // 1..32
+    key: [32]u8 = @splat(0), // bytes 0x20..0x7E
+    buf: u32 = 0, // address in cart RAM
+    len: u32 = 0, // bytes at buf
+    result: u32 = 0, // written by the OS, per op
+
+    comptime {
+        std.debug.assert(@sizeOf(SaveRequest) == 64);
+    }
+};
+
+pub const SaveOp = enum(u32) {
+    probe = 1, // result = ABI version (1); len/buf unused
+    read = 2, // copy up to len bytes of key into buf; result = stored size
+    write = 3, // store len bytes from buf as key, atomically (0 < len <= max_blob)
+    delete = 4, // remove key (not_found if absent)
+    stat = 5, // result = free bytes for a new blob; buf/len optional: SaveStat
+    list = 6, // fill buf with up to len/40 SaveListEntry; result = entry count
+    exit_watch = 7, // buf = address of a u32 exit word in cart RAM (0 = unregister)
+    _,
+};
+
+pub const SaveState = enum(u32) { idle = 0, pending = 1, busy = 2, done = 3, _ };
+
+pub const SaveStatus = enum(u32) {
+    ok = 0,
+    not_found = 1,
+    no_space = 2,
+    bad_request = 3,
+    bad_buffer = 4,
+    rate_limited = 5,
+    too_big = 6,
+    io_error = 7,
+    busy = 8,
+    _,
+};
+
+pub const SaveStat = extern struct {
+    version: u32,
+    region_bytes: u32,
+    free_bytes: u32,
+    max_blob: u32,
+    entries: u32,
+    max_entries: u32,
+    writes_left_now: u32,
+    _r: u32 = 0,
+};
+
+pub const SaveListEntry = extern struct { key_len: u32, key: [32]u8, size: u32 };
+
+/// Exit word values (SaveOp.exit_watch).
+pub const EXIT_WORD_IDLE: u32 = 0;
+pub const EXIT_WORD_REQUESTED: u32 = 1; // written by the OS
+pub const EXIT_WORD_READY: u32 = 2; // written by the cart
+
+comptime {
+    std.debug.assert(@sizeOf(SaveStat) == 32);
+    std.debug.assert(@sizeOf(SaveListEntry) == 40);
+}
 
 pub const PresentFlags = packed struct(u32) {
     framebuffer_index: u1,

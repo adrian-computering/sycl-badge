@@ -1,8 +1,8 @@
 //! FAT12-based cart storage: the romfs flash region (USB LUN 0) and, when the
 //! external QSPI flash is present, a second volume on it (USB LUN 1).
 const std = @import("std");
-const rom = @import("../drivers/rom.zig");
 const ext_flash = @import("../drivers/ext_flash.zig");
+const flash_ops = @import("../drivers/flash_ops.zig");
 const fat = @import("../drivers/fat.zig");
 const log = std.log.scoped(.storage);
 
@@ -200,7 +200,7 @@ fn wipeVolume(v: *const Volume) void {
     // interrupts off for tens of seconds.
     var done: usize = 0;
     while (done < erase_len) : (done += FLASH_ERASE_BLOCK) {
-        eraseBlock(@intCast(flash_offset + done));
+        flash_ops.erase(@intCast(flash_offset + done), FLASH_ERASE_BLOCK);
     }
 
     pending_valid = false;
@@ -509,16 +509,6 @@ pub fn romfsSizeBytes() usize {
     return volumes[0].size;
 }
 
-noinline fn eraseBlock(flash_offset: u32) linksection(".ram_text") void {
-    const cs = interrupt.enter_critical_section();
-    defer cs.leave();
-
-    rom.flash_exit_xip();
-    rom.flash_range_erase(flash_offset, FLASH_ERASE_BLOCK, FLASH_ERASE_BLOCK, FLASH_ERASE_CMD);
-    rom.flash_flush_cache();
-    rom.flash_enter_cmd_xip();
-}
-
 fn flushPending() linksection(".ram_text") void {
     if (!pending_valid) {
         return; // Silent (no pending data)
@@ -530,14 +520,8 @@ fn flushPending() linksection(".ram_text") void {
     const flash_offset = pending_block_addr - XIP_BASE;
     log.debug("flushPending: flash_offset=0x{x}, size={d}", .{ flash_offset, FLASH_ERASE_BLOCK });
 
-    const cs = interrupt.enter_critical_section();
-    defer cs.leave();
-
-    rom.flash_exit_xip();
-    rom.flash_range_erase(flash_offset, FLASH_ERASE_BLOCK, FLASH_ERASE_BLOCK, FLASH_ERASE_CMD);
-    rom.flash_range_program(flash_offset, pending_buf[0..FLASH_ERASE_BLOCK]);
-    rom.flash_flush_cache();
-    rom.flash_enter_cmd_xip();
+    // Critical section, XIP off, QMI window 0 restored afterwards.
+    flash_ops.eraseAndProgram(flash_offset, FLASH_ERASE_BLOCK, pending_buf[0..FLASH_ERASE_BLOCK]);
     pending_dirty = false;
 }
 

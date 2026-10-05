@@ -26,6 +26,7 @@ const std = @import("std");
 const microzig = @import("microzig");
 const hal = microzig.hal;
 const rom = @import("rom.zig");
+const flash_ops = @import("flash_ops.zig");
 const timer = @import("timer.zig");
 const log = std.log.scoped(.ext_flash);
 
@@ -203,6 +204,9 @@ fn bringUp(attempts: u32, allow_qe: bool) void {
         setDevinfo(found.size);
         if (allow_qe) {
             const qe = ensureQuadEnable();
+            // Without QE, window 0's quad reads garble CS1: flash writes
+            // must leave window 0 serial (flash_ops).
+            flash_ops.keep_window0_serial = !(qe.status == .already or qe.status == .set_now);
             diag = (diag & 0xFFFF_0F00) | (@as(u32, @intFromEnum(qe.status)) << 12) | qe.sr2;
             log.info("external flash: QE {s}, SR1 0x{X:0>2} SR2 0x{X:0>2}", .{ @tagName(qe.status), qe.sr1, qe.sr2 });
         }
@@ -491,7 +495,7 @@ pub fn erase(offset: u32, len: usize) Error!void {
     try checkRange(offset, len, sector_size);
     var done: u32 = 0;
     while (done < len) : (done += sector_size) {
-        eraseRaw(flash_offset + offset + done, sector_size);
+        flash_ops.erase(flash_offset + offset + done, sector_size);
     }
 }
 
@@ -503,25 +507,7 @@ pub fn program(offset: u32, data: []const u8) Error!void {
     var done: u32 = 0;
     while (done < data.len) {
         const n = @min(data.len - done, sector_size);
-        programRaw(flash_offset + offset + done, data[done..][0..n]);
+        flash_ops.program(flash_offset + offset + done, data[done..][0..n]);
         done += n;
     }
-}
-
-noinline fn eraseRaw(off: u32, len: usize) linksection(".ram_text") void {
-    const cs = interrupt.enter_critical_section();
-    defer cs.leave();
-    rom.flash_exit_xip();
-    rom.flash_range_erase(off, len, sector_size, SECTOR_ERASE_CMD);
-    rom.flash_flush_cache();
-    rom.flash_enter_cmd_xip();
-}
-
-noinline fn programRaw(off: u32, data: []const u8) linksection(".ram_text") void {
-    const cs = interrupt.enter_critical_section();
-    defer cs.leave();
-    rom.flash_exit_xip();
-    rom.flash_range_program(off, data);
-    rom.flash_flush_cache();
-    rom.flash_enter_cmd_xip();
 }

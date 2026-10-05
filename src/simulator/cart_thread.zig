@@ -3,6 +3,7 @@ pub const abi = @import("sim_abi");
 const sdl = @import("sdl3");
 const root = @import("root");
 const serial = @import("serial.zig");
+const saves = @import("saves.zig");
 
 extern fn cart_must_call_export_start_code() void;
 extern var simulator_io_block: abi.SimulatorIO;
@@ -159,7 +160,12 @@ const sim_api: abi.SimulatorAPI = .{
     .serial_write = &serial.cart_serial_write,
     .serial_bytes_available = &serial.cart_serial_bytes_available,
     .serial_space_available = &serial.cart_serial_space_available,
+    .save_request = &cart_save_request,
 };
+
+fn cart_save_request(req: *abi.SaveRequest, buf: ?[*]u8) callconv(.c) void {
+    saves.handle(req, buf, cart_micros_since_boot());
+}
 
 fn cart_mark_canceled() void {
     @atomicStore(bool, &cart_running, false, .seq_cst);

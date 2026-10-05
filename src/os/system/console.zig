@@ -14,6 +14,7 @@ const shared_mem = @import("../ipc/shared_mem.zig");
 const storage = @import("../loader/storage.zig");
 const loader = @import("../loader/loader.zig");
 const multicore = @import("multicore.zig");
+const saves = @import("saves.zig");
 const fps_overlay = @import("fps_overlay.zig");
 const id_command = @import("id_command.zig");
 const badge = microzig.board;
@@ -158,7 +159,7 @@ const commands = [_]Command{
     .{ .name = "overlay", .description = "LCD overlay controls (overlay fps [on|off])", .handler = cmdOverlay, .completion_provider = overlayCompletions },
     .{ .name = "storage", .description = "Show storage filesystem statistics", .handler = cmdStorage },
     .{ .name = "extflash", .description = "External QSPI flash (info/read <hex off> [len]/test confirm)", .handler = cmdExtFlash },
-    .{ .name = "wipe", .description = "Erase cart XIP flash and process RAM (wipe confirm)", .handler = cmdWipe },
+    .{ .name = "wipe", .description = "Clear process RAM (wipe confirm)", .handler = cmdWipe },
     .{ .name = "menu", .description = "Return to cart selection screen", .handler = cmdMenu },
     .{ .name = "reboot", .description = "Restart the system (reboot [bootsel])", .handler = cmdReboot, .completion_provider = rebootCompletions },
 };
@@ -1128,12 +1129,13 @@ fn extFlashSelfTest(offset: u32) void {
     println(if (bad == 0 and cached_ok and restored == n) "PASS\r\n" else "FAIL\r\n");
 }
 
-// Wipe Command - Erase cart/XIP flash and process RAM
+// Wipe Command - Clear process RAM. (It used to erase the cart XIP flash region
+// too; that region now holds the cart save store, which only the store may erase.)
 fn cmdWipe(iter: *std.mem.TokenIterator(u8, .scalar)) void {
     const confirm = iter.next();
 
     if (confirm == null or !std.mem.eql(u8, confirm.?, "confirm")) {
-        println("\r\nWARNING: This will erase all cart XIP flash and process RAM!");
+        println("\r\nWARNING: This will clear all process RAM!");
         println("To proceed, type: wipe confirm\r\n");
         return;
     }
@@ -1146,13 +1148,6 @@ fn cmdWipe(iter: *std.mem.TokenIterator(u8, .scalar)) void {
         multicore.resetCore1();
     }
 
-    // Erase cart XIP flash region
-    println("Erasing cart XIP flash region...");
-    loader.eraseCartRegion() catch {
-        println("ERROR: Failed to erase cart XIP region\r\n");
-        return;
-    };
-
     // Clear process RAM (Core 1 RAM: 0x20020000 - 0x20080000, 384KB)
     println("Clearing process RAM...");
     const PROCESS_RAM_START: u32 = 0x20020000;
@@ -1160,11 +1155,7 @@ fn cmdWipe(iter: *std.mem.TokenIterator(u8, .scalar)) void {
     const process_ram: [*]u8 = @ptrFromInt(PROCESS_RAM_START);
     @memset(process_ram[0..PROCESS_RAM_SIZE], 0);
 
-    printf("\r\nWipe complete!\r\n  Cart XIP: 0x{x} - 0x{x} ({d}KB)\r\n", .{
-        loader.getCartXipStart(),
-        loader.getCartXipEnd(),
-        loader.getCartXipSize() / 1024,
-    });
+    println("\r\nWipe complete! (cart saves are kept)");
     printf("  Process RAM: 0x{x} - 0x{x} ({d}KB)\r\n\r\n", .{
         PROCESS_RAM_START,
         PROCESS_RAM_START + PROCESS_RAM_SIZE,
@@ -1410,10 +1401,11 @@ fn cmdLoad(iter: *std.mem.TokenIterator(u8, .scalar)) void {
             loader.LoadError.FileTooLarge => println("UF2 file too large (max 256KB binary)\r\n"),
             loader.LoadError.InvalidUF2 => println("Invalid UF2 format\r\n"),
             loader.LoadError.UnsupportedFamily => println("Unsupported chip family (need RP2354B)\r\n"),
-            loader.LoadError.AddressMismatch => println("UF2 not linked for cart_xip region (0x101C0000)\r\n"),
+            loader.LoadError.AddressMismatch => println("UF2 not linked for process RAM\r\n"),
             loader.LoadError.VersionMismatch => println("Cart has unknown version\r\n"),
             loader.LoadError.FlashWriteError => println("Flash write error\r\n"),
             loader.LoadError.ReadError => println("Storage read error\r\n"),
+            loader.LoadError.XipUnsupported => println("XIP carts are not supported (rebuild as a RAM cart)\r\n"),
         }
         return;
     };
@@ -1467,10 +1459,10 @@ fn cmdCart(iter: *std.mem.TokenIterator(u8, .scalar)) void {
         if (state == .ready or state == .running) {
             printf("  Entry point: {any}\r\n", .{loader.getEntryPoint()});
         }
-        printf("  Cart XIP region: 0x{x} - 0x{x} ({d}KB)\r\n", .{
-            loader.getCartXipStart(),
-            loader.getCartXipEnd(),
-            loader.getCartXipSize() / 1024,
+        printf("  Save store region: 0x{x} - 0x{x} ({d}KB)\r\n", .{
+            saves.regionStart(),
+            saves.regionEnd(),
+            (saves.regionEnd() - saves.regionStart()) / 1024,
         });
 
         // ROMFS / storage info
@@ -1562,10 +1554,11 @@ fn cmdCart(iter: *std.mem.TokenIterator(u8, .scalar)) void {
                 loader.LoadError.FileTooLarge => println("UF2 file too large (max 256KB binary)\r\n"),
                 loader.LoadError.InvalidUF2 => println("Invalid UF2 format\r\n"),
                 loader.LoadError.UnsupportedFamily => println("Unsupported chip family (need RP2354B)\r\n"),
-                loader.LoadError.AddressMismatch => println("UF2 not linked for cart_xip region (0x101C0000)\r\n"),
+                loader.LoadError.AddressMismatch => println("UF2 not linked for process RAM\r\n"),
                 loader.LoadError.VersionMismatch => println("Cart has unknown version\r\n"),
                 loader.LoadError.FlashWriteError => println("Flash write error\r\n"),
                 loader.LoadError.ReadError => println("Storage read error\r\n"),
+                loader.LoadError.XipUnsupported => println("XIP carts are not supported (rebuild as a RAM cart)\r\n"),
             }
 
             return;

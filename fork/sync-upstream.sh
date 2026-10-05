@@ -16,9 +16,9 @@ FEATURES=(
   feature/cart-serial:feature/usb-console
   feature/net-lobby:feature/cart-serial
   feature/ext-flash:upstream/main
+  feature/cart-saves:upstream/main
 )
 IN_PROGRESS=(
-  feature/cart-saves:upstream/main
 )
 
 ZIG="${ZIG:-zig}"

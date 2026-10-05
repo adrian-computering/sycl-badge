@@ -14,6 +14,7 @@ const storage = @import("../loader/storage.zig");
 const loader = @import("../loader/loader.zig");
 const multicore = @import("multicore.zig");
 const fps_overlay = @import("fps_overlay.zig");
+const id_command = @import("id_command.zig");
 const badge = microzig.board;
 
 // Console Configuration
@@ -147,6 +148,7 @@ fn cartCompletions(arg_index: usize, partial: []const u8) []const []const u8 {
 const commands = [_]Command{
     .{ .name = "help", .description = "List available commands", .handler = cmdHelp },
     .{ .name = "uptime", .description = "Show system uptime", .handler = cmdUptime },
+    .{ .name = "id", .description = "Show chip id, firmware version, cart serial state", .handler = id_command.cmd_id },
     .{ .name = "clear", .description = "Clear terminal screen", .handler = cmdClear },
     .{ .name = "history", .description = "Show command history", .handler = cmdHistory },
     .{ .name = "gpio", .description = "GPIO operations (read/write/toggle/list)", .handler = cmdGpio, .completion_provider = gpioCompletions },

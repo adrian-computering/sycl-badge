@@ -10,6 +10,7 @@ const peripherals = microzig.chip.peripherals;
 const mailbox = @import("../ipc/mailbox.zig");
 const shared_mem = @import("../ipc/shared_mem.zig");
 const timer = @import("../drivers/timer.zig");
+const cart_serial = @import("cart_serial.zig");
 
 const CriticalSection = interrupt.CriticalSection;
 const SIO = peripherals.SIO;
@@ -149,6 +150,9 @@ pub fn haltCore1() void {
     // Drain FIFO again after reset
     fifo.drain();
     mailbox.clear();
+
+    // The cart is gone, stop serving its serial rings before its RAM is reused
+    cart_serial.detach();
 
     core1_running = false;
     core1_initialized = false;

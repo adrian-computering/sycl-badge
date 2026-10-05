@@ -107,8 +107,14 @@ pub fn RequestPacketProcessor(comptime config: Config) type {
             };
         }
 
+        /// Rejects the current request. Both directions of EP0 are stalled:
+        /// a request without a data stage gets its STALL in the IN status
+        /// stage, and a stalled OUT endpoint keeps a data stage from being
+        /// accepted. The controller clears both on the next SETUP packet.
         fn stall(dir: types.Dir) void {
-            config.callbacks.stall(.{ .num = .ep0, .dir = dir });
+            _ = dir;
+            config.callbacks.stall(.{ .num = .ep0, .dir = .in });
+            config.callbacks.stall(.{ .num = .ep0, .dir = .out });
         }
 
         fn submit_setup_request_standard(self: *@This(), pkt: *const types.SetupPacket) void {
@@ -129,7 +135,13 @@ pub fn RequestPacketProcessor(comptime config: Config) type {
                     const payload: []const u8 = switch (desc_type) {
                         .device => std.mem.asBytes(self.desc.device),
                         .string => blk: {
-                            const desc = self.desc.string.lookup(lang, desc_idx) orelse break :blk "";
+                            for (self.desc.runtime_strings) |entry| {
+                                if (entry.index == desc_idx) break :blk entry.payload;
+                            }
+                            const desc = self.desc.string.lookup(lang, desc_idx) orelse {
+                                stall(dir);
+                                return;
+                            };
                             assert(desc.valid(), .{});
                             log.debug("str='{f}'", .{desc});
                             break :blk desc.payload;
@@ -215,8 +227,8 @@ pub fn RequestPacketProcessor(comptime config: Config) type {
                         length_two,
                     });
 
-                    // TODO: probably need to forward to the interface/driver?
-                    stall(dir);
+                    // Interface status is reserved, always zero
+                    self.queue_in_xfer(&.{ 0, 0 }, pkt.length.native());
                 },
                 .get_status_endpoint => {
                     const zero_interface_endpoint = pkt.index.native();
@@ -276,7 +288,8 @@ pub fn RequestPacketProcessor(comptime config: Config) type {
                 else => {},
             }
 
-            log.err("Unahndled setup request: {f}", .{pkt.*});
+            log.warn("Unhandled setup request: {f}", .{pkt.*});
+            stall(pkt.request_type.direction);
         }
 
         pub fn submit_setup_request(self: *@This(), pkt: types.SetupPacket) void {
@@ -285,6 +298,12 @@ pub fn RequestPacketProcessor(comptime config: Config) type {
                 .standard => self.submit_setup_request_standard(&pkt),
                 .class => self.submit_setup_request_class(&pkt),
                 else => stall(pkt.request_type.direction),
+            }
+
+            // A data packet that arrived together with this SETUP packet
+            // belongs to it. If the request did not take it, drop it.
+            if (self.ready.out and self.sm != .receiving_data) {
+                self.ready.out = false;
             }
         }
 
@@ -308,11 +327,15 @@ pub fn RequestPacketProcessor(comptime config: Config) type {
                     .completion = completion,
                 },
             };
+
+            // The data stage may already be waiting in the buffer, otherwise
+            // make sure the endpoint is armed for it
+            if (!self.ready.out) config.callbacks.queue_receive();
         }
 
         /// Rejects the current request.
         pub fn stall_ep0(self: *@This()) void {
-            config.callbacks.stall(.{ .num = .ep0, .dir = .in });
+            stall(.in);
             self.sm = .awaiting_request;
         }
 
@@ -371,7 +394,6 @@ pub fn RequestPacketProcessor(comptime config: Config) type {
                         .err => {
                             log.warn("control OUT data stage failed", .{});
                             self.stall_ep0();
-                            config.callbacks.queue_receive();
                         },
                     }
                 },
@@ -567,7 +589,7 @@ pub fn OutTransferProcessor(comptime config: OutTransferConfig) type {
         const log = std.log.scoped(.out_xfer);
 
         pub fn start(host_len: usize) !@This() {
-            if (host_len == 0) {
+            if (host_len == 0 or host_len > config.max_transfer_size) {
                 return error.ProtocolViolation;
             }
 
@@ -599,38 +621,20 @@ pub fn OutTransferProcessor(comptime config: OutTransferConfig) type {
                     if (pkt.len > config.max_packet_size)
                         return error.ProtocolViolation;
 
-                    if (self.host_len % config.max_packet_size == 0) {
-                        // Termniated with a zlp
-                        if (pkt.len == 0) {
-                            if (self.progress == self.host_len) {
-                                self.state = .done;
-                                continue :state .done;
-                            }
-
-                            return error.ProtocolViolation;
-                        }
-
-                        if (pkt.len != config.max_packet_size) {
-                            return error.ProtocolViolation;
-                        }
-                    } else {
-                        // Terminated with a short packet
-                        if (pkt.len < config.max_packet_size and (pkt.len + self.progress) != self.host_len)
-                            return error.ProtocolViolation;
-
-                        if (pkt.len == config.max_packet_size and (pkt.len + self.progress) > self.host_len)
-                            return error.ProtocolViolation;
-                    }
-
-                    const begin = self.progress;
+                    // The host never sends more than wLength bytes, and only
+                    // the last packet may be short. The data stage ends once
+                    // all wLength bytes arrived: unlike a control IN transfer
+                    // there is no zero length packet.
                     const end = self.progress + pkt.len;
                     if (end > self.host_len)
                         return error.ProtocolViolation;
+                    if (pkt.len < config.max_packet_size and end != self.host_len)
+                        return error.ProtocolViolation;
 
-                    @memcpy(self.buf[begin..end], pkt[0..pkt.len]);
-                    self.progress += pkt.len;
+                    @memcpy(self.buf[self.progress..end], pkt);
+                    self.progress = end;
 
-                    if (self.progress == self.host_len and pkt.len < config.max_packet_size) {
+                    if (self.progress == self.host_len) {
                         self.state = .done;
                         continue :state .done;
                     }
@@ -683,6 +687,15 @@ pub const Descriptors = struct {
     device: *const descriptor.Device,
     string: StringDescriptors,
     configurations: []const []const u8,
+    /// String descriptors built at run time (for example the serial number).
+    /// They take precedence over `string` entries with the same index.
+    runtime_strings: []const RuntimeString = &.{},
+
+    pub const RuntimeString = struct {
+        index: u8,
+        /// Complete descriptor: length, type 0x03, UTF-16LE text
+        payload: []const u8,
+    };
     //interfaces: []const descriptor.Interface,
     //endpoints: []const descriptor.Endpoint,
 
@@ -717,11 +730,15 @@ pub const StringDescriptors = struct {
     };
 
     pub fn lookup(s: *const StringDescriptors, lang: Language, index: usize) ?Wrapper {
+        // String 0 (the language list) is requested with language 0, and
+        // hosts may ask for a language the device does not have: answer with
+        // the first language rather than nothing
         const lang_idx = for (s.langs, 0..) |entry_lang, i| {
             if (entry_lang == lang)
                 break i;
-        } else return null;
+        } else 0;
 
+        if (index >= s.offsets[lang_idx].len) return null;
         const offset = s.offsets[lang_idx][index];
         // First byte of the descriptor is the length;
         const len = s.data[offset];

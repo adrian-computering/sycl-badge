@@ -11,6 +11,16 @@
 > port for multiplayer, support for the board's second 2 MB flash chip, and
 > cart saves. Each is its own branch; `main` combines them. See
 > [FORK.md](FORK.md).
+>
+> **One lasting change to the badge.** The external flash feature sets the
+> extra chip's **QE (quad enable) bit** on the first boot that finds the chip.
+> QE is non-volatile, in the chip's own status register, so it **stays set
+> after you flash any other firmware**, upstream included. That is harmless:
+> stock firmware never uses the chip, and QE only turns the chip's WP#/HOLD#
+> pins into data pins (they would otherwise garble its reads). It is set only
+> from the factory all-zero status registers and can be cleared by writing
+> status register 2 back to 0. Files on the extra drive also stay on the chip,
+> hidden, under other firmware. Details: [fork/EXT_FLASH.md](fork/EXT_FLASH.md).
 
 Welcome to the SYCL badge repository.
 

@@ -24,6 +24,18 @@ main drive is not touched, so its carts survive. Copy `.uf2` carts to either
 drive. Going back to upstream firmware hides SYCLEXTRA but leaves its files
 on the chip.
 
+**The one lasting change.** The first boot that finds the chip sets its QE
+(quad enable) bit, status register 2 bit 1. QE is non-volatile: it stays set
+through power cycles and after you flash any other firmware, including
+upstream. Nothing else depends on it: stock firmware never selects the chip,
+and QE only changes what two of the chip's own pins (WP#/HOLD#) mean (see
+"QE bit" below for why it is needed). The firmware sets it only when both
+status registers read the factory all-zeros, and never writes any other bit
+(status register 2 also holds one-time lock bits). To undo it, write status
+register 2 back to 0 (`06h`, then `31h 00h`, in QMI direct mode with XIP
+off); no tool here does that yet. Probe page 3 shows "QE: already on" or
+"SET NOW" once it is set.
+
 `carts/extflash-probe` is a diagnostic cart. Page 1 talks to the chip
 directly, so it works on stock firmware too (CHIP ALIVE, SFDP 2048 KB, ID
 C8 14). Page 3 shows what the OS found at boot and runs a write self-test on

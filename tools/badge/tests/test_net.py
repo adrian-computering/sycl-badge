@@ -1,7 +1,11 @@
-"""Tests for badge.net (network lobby). Run: python3 -m unittest discover tools/badge/tests"""
+"""Network lobby (badge.net): a real LobbyServer hub, joiners, fake carts.
 
+Run: python3 -m unittest discover tools/badge/tests
+Real tailcat end to end (needs tailcat + internet): BADGE_TEST_TAILCAT=1
+"""
+
+import argparse
 import os
-import queue
 import socket
 import stat
 import sys
@@ -10,9 +14,14 @@ import threading
 import time
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, ".."))
+sys.path.insert(0, HERE)
 
-from badge import net  # noqa: E402
+from badge import frames, net  # noqa: E402
+from badge.links import open_link  # noqa: E402
+from badge.lobby import Lobby, LobbyServer, SimSource  # noqa: E402
+from fakecart import FakeCart  # noqa: E402
 
 WAIT = 5.0
 
@@ -26,75 +35,49 @@ def until(pred, timeout=WAIT):
     return False
 
 
-class FakePort:
-    """A cart serial port: the test plays the cart through `to_host` / `from_host`."""
-
-    def __init__(self, registry):
-        self.to_host = queue.Queue()
-        self.from_host = bytearray()
-        self.closed = False
-        self.fail = None
-        registry.append(self)
-
-    def read(self, n, timeout):
-        if self.fail:
-            raise self.fail
-        if self.closed:
-            raise OSError("closed")
-        try:
-            return self.to_host.get(timeout=timeout)
-        except queue.Empty:
-            return b""
-
-    def write(self, data):
-        if self.fail:
-            raise self.fail
-        self.from_host += data
-
-    def close(self):
-        self.closed = True
+def roster(cart):
+    r = cart.of(frames.Roster)
+    return sorted(n for _, n in r[-1].players) if r else None
 
 
-class FakeHub:
-    """Accepts joiner streams; records bytes per connection and can reply."""
+def data_of(cart):
+    return [m.data for m in cart.of(frames.Data)]
 
-    def __init__(self, port=0):
-        self.listener = net.Listener("127.0.0.1", port)
-        self.port = self.listener.port
-        self.conns = []
-        self.data = {}
-        self._stop = threading.Event()
-        self._t = threading.Thread(target=self._accept, daemon=True)
-        self._t.start()
 
-    def _accept(self):
-        while not self._stop.is_set():
-            c = self.listener.accept(0.05)
-            if c is None:
-                continue
-            i = len(self.conns)
-            self.conns.append(c)
-            self.data[i] = bytearray()
-            threading.Thread(target=self._read, args=(i, c), daemon=True).start()
+class Hub:
+    """`badge lobby --listen` in-process: LobbyServer + ListenSource (+ local sims)."""
 
-    def _read(self, i, c):
-        try:
-            while d := c.recv(4096):
-                self.data[i] += d
-        except OSError:
-            pass
-        self.data[i] += b"<EOF>"
+    def __init__(self, port=0, local=()):
+        self.logs = []
+        self.server = LobbyServer(Lobby(log=self.logs.append), log=self.logs.append,
+                                  stats_interval=0, reopen_delay=0.2)
+        self.src = net.ListenSource("127.0.0.1", port)
+        self.port = self.src.port
+        self.server.add_source(self.src)
+        if local:
+            self.server.add_source(SimSource([(c.host, c.port) for c in local], interval=0.1))
+        self.thread = threading.Thread(target=self.server.run, daemon=True)
+        self.thread.start()
 
     def close(self):
-        self._stop.set()
-        self._t.join()
-        self.listener.close()
-        for c in self.conns:
-            try:
-                c.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            c.close()
+        self.src.stop()
+        self.server.stop()
+        self.thread.join(WAIT)
+
+
+def fast_joiner(connect, carts, events=None, **kw):
+    found = {"sim:%d" % c.port: "socket://127.0.0.1:%d" % c.port for c in carts}
+    opts = dict(scan_interval=0.05, backoff_min=0.05, backoff_max=0.2, handshake=1.0)
+    opts.update(kw)
+    j = net.Joiner(connect, lambda: dict(found),
+                   lambda key, url: open_link(url, key=key, timeout=0.5),
+                   on_event=(events.append if events is not None else lambda e: None), **opts)
+    j.found = found
+    stop = threading.Event()
+    t = threading.Thread(target=j.run, args=(stop,), daemon=True)
+    t.start()
+    j.stop_all = lambda: (stop.set(), t.join(WAIT))
+    return j
 
 
 class HostPortTest(unittest.TestCase):
@@ -113,73 +96,161 @@ class HostPortTest(unittest.TestCase):
         self.assertFalse(net.is_tailcat_address("tc"))
 
 
-class JoinerTest(unittest.TestCase):
+class PingerTest(unittest.TestCase):
+    def test_own_pongs_removed_everything_else_kept(self):
+        p = net._Pinger(7)
+        other = frames.encode(frames.Pong(token=8).pack())  # the cart's own PING reply
+        data = frames.encode(frames.Data(sender=1, data=b"\x00hi").pack())
+        stream = b"\x00" + p.pong + data + p.pong + other
+        self.assertEqual(p.filter(stream), b"\x00" + data + other)
+        self.assertEqual(p.pongs, 2)
+
+    def test_split_frames_held_until_complete(self):
+        p = net._Pinger(7)
+        data = frames.encode(frames.Data(sender=2, data=b"abc").pack())
+        stream = data + p.pong + data
+        out = b"".join(p.filter(stream[i:i + 1]) for i in range(len(stream)))
+        self.assertEqual(out, data + data)
+        self.assertEqual(p.pongs, 1)
+
+
+class NetLobbyTest(unittest.TestCase):
     def setUp(self):
-        self.hub = FakeHub()
-        self.ports = []
-        self.found = {"badge-A": "A"}
-        self.events = []
-        self.joiner = net.Joiner(
-            net.tcp_connector("127.0.0.1", self.hub.port),
-            lambda: dict(self.found),
-            lambda desc: FakePort(self.ports),
-            on_event=self.events.append,
-            scan_interval=0.05, backoff_min=0.05, backoff_max=0.2)
-        self.stop = threading.Event()
-        self.thread = threading.Thread(target=self.joiner.run, args=(self.stop,), daemon=True)
-        self.thread.start()
+        self.carts, self.joiners, self.hubs, self.events = [], [], [], []
 
     def tearDown(self):
-        self.stop.set()
-        self.thread.join(WAIT)
-        self.hub.close()
+        for j in self.joiners:
+            j.stop_all()
+        for h in self.hubs:
+            h.close()
+        for c in self.carts:
+            c.close()
 
-    def kinds(self, key="badge-A"):
-        return [e.kind for e in self.events if e.key == key]
+    def cart(self, **kw):
+        c = FakeCart(**kw)
+        self.carts.append(c)
+        return c
 
-    def test_bytes_pass_through_both_ways(self):
-        self.assertTrue(until(lambda: self.ports and self.hub.conns))
-        port, conn = self.ports[0], self.hub.conns[0]
-        port.to_host.put(b"\x02hello\x00")
-        self.assertTrue(until(lambda: self.hub.data[0] == b"\x00\x02hello\x00"))
-        conn.sendall(b"\x03from-hub\x00")
-        self.assertTrue(until(lambda: port.from_host == b"\x00\x03from-hub\x00"))
+    def hub(self, **kw):
+        h = Hub(**kw)
+        self.hubs.append(h)
+        return h
 
-    def test_hub_restart_cycles_the_port(self):
-        self.assertTrue(until(lambda: self.ports and self.hub.conns))
-        old = self.hub.port
-        self.hub.close()
-        # Cart must see the host go away while the hub is down.
-        self.assertTrue(until(lambda: self.ports[0].closed))
-        self.assertTrue(until(lambda: "disconnected" in self.kinds()))
-        self.hub = FakeHub(old)
-        self.assertTrue(until(lambda: len(self.ports) == 2 and self.hub.conns))
-        self.assertFalse(self.ports[1].closed)
-        self.ports[1].to_host.put(b"\x01again\x00")
-        self.assertTrue(until(lambda: self.hub.data[0].endswith(b"\x01again\x00")))
+    def join(self, port, carts, **kw):
+        j = fast_joiner(net.tcp_connector("127.0.0.1", port), carts, self.events, **kw)
+        self.joiners.append(j)
+        return j
 
-    def test_unreachable_hub_keeps_port_closed(self):
-        old = self.hub.port
-        self.hub.close()
-        self.assertTrue(until(lambda: self.ports and self.ports[-1].closed))
-        n = len(self.ports)
+    def test_local_and_remote_players_share_a_room(self):
+        home = self.cart(game="DOTS", name="home")
+        h = self.hub(local=[home])
+        r1 = self.cart(game="DOTS", name="remote1")
+        r2 = self.cart(game="DOTS", name="remote2")
+        self.join(h.port, [r1])
+        self.join(h.port, [r2])  # a second joiner computer
+        everyone = ["home", "remote1", "remote2"]
+        for c in (home, r1, r2):
+            c.wait_for(lambda m, c=c: roster(c) == everyone)
+        for i in range(30):
+            r1.send(0xFF, bytes([i]))
+        home.wait_for(lambda m: len(data_of(home)) == 30)
+        r2.wait_for(lambda m: len(data_of(r2)) == 30)
+        self.assertEqual(data_of(home), [bytes([i]) for i in range(30)])  # order kept
+        self.assertEqual(data_of(r2), data_of(home))
+        home.send(0xFF, b"back")
+        r1.wait_for(lambda m: b"back" in data_of(r1))
+        self.assertTrue(any(k.startswith("net:") for k in h.server.open_keys()))
+
+    def test_hub_restart_rejoins(self):
+        h = self.hub()
+        a, b = self.cart(game="G", name="a"), self.cart(game="G", name="b")
+        self.join(h.port, [a, b])
+        a.wait_for(lambda m: roster(a) == ["a", "b"])
+        port = h.port
+        h.close()
+        self.hubs.remove(h)
+        # carts see the host go away while the hub is down
+        self.assertTrue(until(lambda: a.conn is None and b.conn is None))
         time.sleep(0.3)
-        self.assertEqual(len(self.ports), n, "port must not reopen while the hub is down")
+        self.assertIsNone(a.conn, "cart port must stay closed while the hub is down")
+        self.hub(port=port)
+        self.assertTrue(until(lambda: a.connections >= 2 and b.connections >= 2))
+        a.wait_for(lambda m: len(a.of(frames.Welcome)) >= 2 and roster(a) == ["a", "b"])
 
-    def test_port_failure_ends_session_and_hub_sees_leave(self):
-        self.assertTrue(until(lambda: self.ports and self.hub.conns))
-        self.found.clear()  # unplugged: discovery no longer lists it
-        self.ports[0].fail = OSError("device disconnected")
-        self.assertTrue(until(lambda: self.hub.data[0].endswith(b"<EOF>")))
-        self.assertTrue(until(lambda: "removed" in self.kinds()))
+    def test_no_hub_no_port(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        dead = s.getsockname()[1]
+        s.close()
+        a = self.cart(name="a")
+        self.join(dead, [a])
+        time.sleep(0.5)
+        self.assertEqual(a.connections, 0)
 
-    def test_hot_plug(self):
-        self.assertTrue(until(lambda: len(self.hub.conns) == 1))
-        self.found["badge-B"] = "B"
-        self.assertTrue(until(lambda: len(self.hub.conns) == 2))
-        del self.found["badge-A"]
-        self.assertTrue(until(lambda: self.hub.data[0].endswith(b"<EOF>")))
-        self.assertFalse(self.hub.data[1].endswith(b"<EOF>"))
+    def test_tunnel_up_but_hub_down_keeps_port_closed(self):
+        # tailcat's local end accepts even when the hub is gone; the handshake catches it
+        mute = socket.socket()
+        mute.bind(("127.0.0.1", 0))
+        mute.listen(8)
+        self.addCleanup(mute.close)
+        a = self.cart(name="a")
+        self.join(mute.getsockname()[1], [a], handshake=0.2)
+        time.sleep(0.8)
+        self.assertEqual(a.connections, 0)
+        self.assertTrue(any("no answer from hub" in e.detail for e in self.events))
+
+    def test_hub_goes_silent_closes_port(self):
+        # answers the handshake PING, then never says anything again
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        self.addCleanup(srv.close)
+        held = []
+
+        def fake_hub():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                held.append(c)
+                dec = frames.FrameDecoder()
+                while True:
+                    buf = c.recv(4096)
+                    if not buf:
+                        break
+                    pings = [b for b in dec.feed(buf) if b[0] == frames.PING]
+                    if pings:
+                        c.sendall(frames.encode(frames.Pong(token=frames.unpack(pings[0]).token).pack()))
+                        break
+        threading.Thread(target=fake_hub, daemon=True).start()
+        a = self.cart(name="a")
+        self.join(srv.getsockname()[1], [a], heartbeat=0.1, dead_after=0.3)
+        self.assertTrue(until(lambda: a.connections >= 1))
+        self.assertTrue(until(lambda: any("hub silent" in e.detail for e in self.events)))
+        for c in held:
+            c.close()
+
+    def test_heartbeat_pongs_never_reach_the_cart(self):
+        h = self.hub()
+        a = self.cart(game="G", name="a")
+        self.join(h.port, [a], heartbeat=0.05, dead_after=1.0)
+        a.wait_for(lambda m: roster(a) == ["a"])
+        time.sleep(0.6)  # ~10 heartbeats
+        self.assertEqual(a.of(frames.Pong), [])
+        a.send_body(frames.Ping(token=99).pack())  # the cart's own ping still works
+        a.wait_for(lambda m: frames.Pong(token=99) in m)
+        self.assertIsNotNone(a.conn)
+
+    def test_simulator_quits_player_leaves(self):
+        h = self.hub()
+        a, b = self.cart(game="G", name="a"), self.cart(game="G", name="b")
+        j = self.join(h.port, [a, b])
+        a.wait_for(lambda m: roster(a) == ["a", "b"])
+        del j.found["sim:%d" % b.port]
+        b.close()
+        a.wait_for(lambda m: roster(a) == ["a"])
+        self.assertTrue(until(lambda: any(e.kind == "removed" for e in self.events)))
 
 
 FAKE_TAILCAT = r"""#!/usr/bin/env python3
@@ -199,6 +270,16 @@ sys.stderr.flush()
 time.sleep(60)
 """
 
+ADDR = "tcFAKEaddrFAKEaddrFAKEaddrFAKEaddr0123"
+
+
+def join_args(target, **kw):
+    a = argparse.Namespace(target=target, remote_port=net.DEFAULT_PORT, sim="none", no_sim=False,
+                           no_usb=True, port=None, tailcat_bin=None)
+    for k, v in kw.items():
+        setattr(a, k, v)
+    return a
+
 
 class TailcatTest(unittest.TestCase):
     def setUp(self):
@@ -215,7 +296,7 @@ class TailcatTest(unittest.TestCase):
     def test_serve_parses_address(self):
         p, addr = net.Tailcat(self.bin).serve(7360)
         try:
-            self.assertEqual(addr, "tcFAKEaddrFAKEaddrFAKEaddrFAKEaddr0123")
+            self.assertEqual(addr, ADDR)
             self.assertIn("--key=new", p.argv)
             self.assertTrue(p.alive())
         finally:
@@ -229,7 +310,7 @@ class TailcatTest(unittest.TestCase):
 
     def test_forward_parses_local_port(self):
         os.environ["FAKE_TAILCAT_LOCAL"] = "43303"
-        p, host, port = net.Tailcat(self.bin).forward("tcFAKEaddrFAKEaddrFAKEaddrFAKEaddr0123", 7360)
+        p, host, port = net.Tailcat(self.bin).forward(ADDR, 7360)
         p.close()
         self.assertEqual((host, port), ("127.0.0.1", 43303))
         self.assertEqual(p.argv[-1], "0:7360")
@@ -244,66 +325,82 @@ class TailcatTest(unittest.TestCase):
         self.assertIn("no DERP", str(cm.exception))
 
     def test_missing_binary(self):
-        old = os.environ["PATH"]
+        old_path, old_home = os.environ["PATH"], os.environ.get("HOME")
         os.environ["PATH"] = self.dir.name + "/nowhere"
+        os.environ["HOME"] = self.dir.name
         try:
-            home = os.environ.get("HOME")
-            os.environ["HOME"] = self.dir.name
             with self.assertRaises(net.TailcatMissing):
                 net.Tailcat()
         finally:
-            os.environ["PATH"] = old
-            if home is not None:
-                os.environ["HOME"] = home
+            os.environ["PATH"] = old_path
+            if old_home is not None:
+                os.environ["HOME"] = old_home
 
-    def test_join_command_over_fake_tunnel(self):
-        hub = FakeHub()
-        os.environ["FAKE_TAILCAT_LOCAL"] = str(hub.port)  # "tunnel" = straight to the hub
-        ports, log, stop = [], [], threading.Event()
-        t = threading.Thread(target=net.join_command, kwargs=dict(
-            target="tcFAKEaddrFAKEaddrFAKEaddrFAKEaddr0123",
-            discover=lambda: {"badge-A": 1}, open_port=lambda d: FakePort(ports),
-            tailcat_bin=self.bin, log=log.append, stop=stop), daemon=True)
+    def test_lobby_flags_print_join_line(self):
+        server = argparse.Namespace(add_source=lambda src: None)
+        logs = []
+        args = argparse.Namespace(listen="127.0.0.1:0", tailcat=True, tailcat_key=None, tailcat_bin=self.bin)
+        cleanup = net.start_lobby_network(args, server, logs.append)
+        cleanup()
+        self.assertTrue(any("badge join " + ADDR in l for l in logs), logs)
+        self.assertTrue(any("--remote-port" in l for l in logs), "port 0 is not the default port")
+
+    def test_cmd_join_over_fake_tunnel(self):
+        h = Hub()
+        a = FakeCart(game="G", name="far")
+        os.environ["FAKE_TAILCAT_LOCAL"] = str(h.port)  # the "tunnel" goes straight to the hub
+        logs, stop = [], threading.Event()
+        args = join_args(ADDR, port=["socket://127.0.0.1:%d" % a.port], tailcat_bin=self.bin)
+        t = threading.Thread(target=net.cmd_join, args=(args,), kwargs=dict(log=logs.append, stop=stop), daemon=True)
         t.start()
         try:
-            self.assertTrue(until(lambda: ports and hub.conns))
-            ports[0].to_host.put(b"\x03ping\x00")
-            self.assertTrue(until(lambda: hub.data[0].endswith(b"\x03ping\x00")))
-            self.assertTrue(until(lambda: any("tailcat path: direct" in l for l in log)))
+            a.wait_for(lambda m: roster(a) == ["far"])
+            self.assertTrue(until(lambda: any("tailcat path: direct" in l for l in logs)))
+            self.assertTrue(any("in the lobby" in l for l in logs), logs)
         finally:
             stop.set()
             t.join(WAIT)
-            hub.close()
+            h.close()
+            a.close()
         self.assertFalse(t.is_alive())
 
 
 @unittest.skipUnless(os.environ.get("BADGE_TEST_TAILCAT"), "set BADGE_TEST_TAILCAT=1 (needs tailcat + internet)")
 class RealTailcatTest(unittest.TestCase):
-    """Hub listener served by real `tailcat serve`, joiner through real `tailcat forward`."""
+    """`badge lobby --listen --tailcat` hub; `badge join tc...` through real tailcat."""
 
     def test_end_to_end(self):
-        hub = FakeHub()
-        serve, addr = net.start_hub_tailcat(hub.port)
-        ports, log, stop = [], [], threading.Event()
-        t = threading.Thread(target=net.join_command, kwargs=dict(
-            target=addr, discover=lambda: {"A": 1, "B": 2},
-            open_port=lambda d: FakePort(ports), remote_port=hub.port,
-            log=log.append, stop=stop), daemon=True)
+        home = FakeCart(game="DOTS", name="home")
+        server = LobbyServer(Lobby(log=lambda m: None), log=lambda m: None, stats_interval=0, reopen_delay=0.2)
+        server.add_source(SimSource([(home.host, home.port)], interval=0.1))
+        logs, stop = [], threading.Event()
+        args = argparse.Namespace(listen="127.0.0.1:0", tailcat=True, tailcat_key=None, tailcat_bin=None)
+        cleanup = net.start_lobby_network(args, server, logs.append)
+        hub_thread = threading.Thread(target=server.run, daemon=True)
+        hub_thread.start()
+        line = next(l for l in logs if "badge join " in l).split("badge join ")[1].split()
+        addr, port = line[0], int(line[2])
+        farA, farB = FakeCart(game="DOTS", name="farA"), FakeCart(game="DOTS", name="farB")
+        jargs = join_args(addr, remote_port=port,
+                          port=["socket://127.0.0.1:%d" % c.port for c in (farA, farB)])
+        t = threading.Thread(target=net.cmd_join, args=(jargs,), kwargs=dict(log=logs.append, stop=stop), daemon=True)
         t.start()
         try:
-            self.assertTrue(until(lambda: len(ports) == 2 and len(hub.conns) == 2, 30))
-            ports[0].to_host.put(b"\x02over-the-tunnel\x00")
-            self.assertTrue(until(lambda: any(d.endswith(b"\x02over-the-tunnel\x00")
-                                              for d in hub.data.values()), 10))
-            hub.conns[1].sendall(b"\x83back\x00")
-            self.assertTrue(until(lambda: any(p.from_host.endswith(b"\x83back\x00") for p in ports), 10))
-            self.assertTrue(until(lambda: any(l.startswith("tailcat path:") for l in log), 20))
-            print("\n" + "\n".join(l for l in log if "path" in l))
+            for c in (home, farA, farB):
+                c.wait_for(lambda m, c=c: roster(c) == ["farA", "farB", "home"], timeout=30)
+            farA.send(0xFF, b"over-the-tunnel")
+            home.wait_for(lambda m: b"over-the-tunnel" in data_of(home), timeout=10)
+            farB.wait_for(lambda m: b"over-the-tunnel" in data_of(farB), timeout=10)
+            self.assertTrue(until(lambda: any(l.startswith("tailcat path:") for l in logs), 20))
+            print("\n" + "\n".join(l for l in logs if "path" in l))
         finally:
             stop.set()
             t.join(WAIT)
-            serve.close()
-            hub.close()
+            cleanup()
+            server.stop()
+            hub_thread.join(WAIT)
+            for c in (home, farA, farB):
+                c.close()
 
 
 if __name__ == "__main__":

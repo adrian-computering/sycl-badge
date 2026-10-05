@@ -791,8 +791,8 @@ fn init_cart_ipc_data() void {
         .ext_flash = ext_flash.present(),
         .ext_volume = @intFromEnum(storage.ext_volume_state),
     };
-    abi.ipc_data.ext_flash_size = ext_flash.size();
-    abi.ipc_data.ext_flash_cart_offset = ext_flash.cartAreaOffset();
+    abi.ipc_data.ext_flash_size_kb = @intCast(ext_flash.size() / 1024);
+    abi.ipc_data.ext_flash_cart_offset_kb = @intCast(ext_flash.cartAreaOffset() / 1024);
     abi.ipc_data.ext_flash_diag = ext_flash.bootDiag();
     abi.ipc_data.cart_dma_channels = board.cart_dma_mask;
 }

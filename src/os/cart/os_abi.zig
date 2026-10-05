@@ -73,19 +73,23 @@ pub const CartIPCData = extern struct {
     clear_color: DisplayColor,         // x150E8..x150EA
     os_flags: packed struct (u16) {    // x150EA..x150EC
         os_clear_supported: bool,
+        /// Taken by the cart-serial fork (cart_serial_supported); this OS
+        /// never sets it.
+        _cart_serial: bool = false,
         /// The external QSPI flash is mapped read-only at ext_flash_base.
         ext_flash: bool = false,
         /// What boot did with the external drive: 0 none, 1 kept,
         /// 2 formatted, 3 reads unstable so not mounted.
         ext_volume: u2 = 0,
-        _reserved: u12 = 0,
+        _reserved: u11 = 0,
     },
 
     cart_dma_channels: u16,            // x150EC..x150EE
     _pad6: u16 = 0,                    // x150EE..x150F0
     app_time: u32,                     // x150F0..x150F4
-    ext_flash_size: u32 = 0,           // x150F4..x150F8, bytes at ext_flash_base when os_flags.ext_flash
-    ext_flash_cart_offset: u32 = 0,    // x150F8..x150FC, start of the cart-writable area (to ext_flash_size)
+    _cart_serial_ptr: u32 = 0,         // x150F4..x150F8, the cart-serial fork's ring pointer; this OS leaves it alone
+    ext_flash_size_kb: u16 = 0,        // x150F8..x150FA, KB at ext_flash_base when os_flags.ext_flash
+    ext_flash_cart_offset_kb: u16 = 0, // x150FA..x150FC, start of the cart-writable area in KB (to the end)
     ext_flash_diag: u32 = 0,           // x150FC..x15100, boot detection result (0 = OS without ext-flash support)
 
     comptime {

@@ -587,9 +587,6 @@ fn listCartsIn(v: *const Volume, index: u8, callback: *const fn (name: []const u
             else
                 formatShortName(entry, &name_buf);
 
-            // The extra drive is meant for ROMs and data too; only its carts go in the menu.
-            if (index > 0 and !std.ascii.endsWithIgnoreCase(display_name, ".uf2")) continue;
-
             const size = readU32(entry, DIR_FILE_SIZE);
             visiting = .{ .volume = index, .start_cluster = readU16(entry, DIR_FIRST_CLUSTER), .size = size };
             callback(display_name, size);

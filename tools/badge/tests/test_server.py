@@ -245,3 +245,44 @@ class HotplugTest(ServerFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(sys.platform.startswith("linux") or sys.platform == "darwin", "needs a pty")
+class PtySerialTest(ServerFixture):
+    """SerialLink on a pseudo terminal: the selectable posix serial path."""
+
+    def test_serial_link_over_pty(self):
+        import tty
+
+        from badge.links import SerialLink
+
+        s = self.start()
+        links = []
+        masters = []
+        for i in range(2):
+            master, slave = os.openpty()
+            tty.setraw(master)
+            tty.setraw(slave)
+            masters.append(master)
+            link = SerialLink(os.ttyname(slave), key="pty%d" % i)
+            os.close(slave)
+            self.assertIsNotNone(link.fileno())
+            links.append(link)
+            s.add_link(link)
+        for i, m in enumerate(masters):
+            os.write(m, frames.encode(frames.Hello(game="PTY", name="p%d" % i).pack()))
+        dec = frames.FrameDecoder()
+        got = []
+        deadline = time.time() + 5
+        while time.time() < deadline and not any(isinstance(x, frames.Roster) and len(x.players) == 2 for x in got):
+            got += [frames.unpack(b) for b in dec.feed(os.read(masters[0], 4096))]
+        self.assertTrue(any(isinstance(x, frames.Roster) and len(x.players) == 2 for x in got), got)
+        os.write(masters[1], frames.encode(frames.Send(to=0xFF, data=b"over pty").pack()))
+        while time.time() < deadline and not any(isinstance(x, frames.Data) for x in got):
+            got += [frames.unpack(b) for b in dec.feed(os.read(masters[0], 4096))]
+        self.assertIn(frames.Data(sender=1, data=b"over pty"), got)
+        os.close(masters[1])  # "unplug": the slave side sees EIO / hangup
+        while time.time() < deadline and not any(isinstance(x, frames.Roster) and len(x.players) == 1 for x in got):
+            got += [frames.unpack(b) for b in dec.feed(os.read(masters[0], 4096))]
+        self.assertTrue(any(isinstance(x, frames.Roster) and len(x.players) == 1 for x in got))
+        os.close(masters[0])

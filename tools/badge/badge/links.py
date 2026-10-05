@@ -12,9 +12,21 @@ monitor`). Every link has the same small interface:
                         thread
     link.closed         True once closed (by either side)
 
+Optional fast path (the lobby relay uses it when fileno() is not None, so
+one thread serves every such link through a selector):
+
+    link.fileno()         -> int, or None when the link cannot be selected
+    link.read_nowait()    -> bytes available now (b"" if none); raises
+                             LinkClosed at end of stream
+    link.write_nowait(b)  -> number of bytes written (0 if it would block)
+
+Calling read_nowait / write_nowait puts the link in non-blocking mode for
+good; use either the blocking or the non-blocking calls on one link.
+
 Implementations: SerialLink (pyserial, DTR asserted, used for badge cart
-ports) and SocketLink (a connected TCP socket: simulators, and inbound
-connections accepted by a network lobby). open_link(url) picks one.
+ports; selectable on Linux and macOS, threads on Windows) and SocketLink (a
+connected TCP socket: simulators, and inbound connections accepted by a
+network lobby). open_link(url) picks one.
 """
 
 from __future__ import annotations
@@ -46,6 +58,15 @@ class Link:
     def close(self) -> None:  # pragma: no cover - interface
         self.closed = True
 
+    def fileno(self) -> Optional[int]:
+        return None
+
+    def read_nowait(self) -> bytes:  # pragma: no cover - interface
+        raise NotImplementedError
+
+    def write_nowait(self, data: bytes) -> int:  # pragma: no cover - interface
+        raise NotImplementedError
+
     def __repr__(self) -> str:
         return "<%s %s>" % (type(self).__name__, self.key or self.label)
 
@@ -59,6 +80,7 @@ class SocketLink(Link):
         self.key = key
         self.label = label or key
         self._lock = threading.Lock()
+        self._nonblocking = False
         sock.setblocking(True)
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -92,6 +114,42 @@ class SocketLink(Link):
             raise LinkClosed("closed")
         try:
             self.sock.sendall(data)
+        except OSError as e:
+            self.close()
+            raise LinkClosed(str(e))
+
+    def fileno(self) -> Optional[int]:
+        return None if self.closed else self.sock.fileno()
+
+    def _go_nonblocking(self) -> None:
+        if not self._nonblocking:
+            self.sock.setblocking(False)
+            self._nonblocking = True
+
+    def read_nowait(self) -> bytes:
+        if self.closed:
+            raise LinkClosed("closed")
+        self._go_nonblocking()
+        try:
+            data = self.sock.recv(65536)
+        except (BlockingIOError, InterruptedError):
+            return b""
+        except OSError as e:
+            self.close()
+            raise LinkClosed(str(e))
+        if not data:
+            self.close()
+            raise LinkClosed("peer closed the connection")
+        return data
+
+    def write_nowait(self, data: bytes) -> int:
+        if self.closed:
+            raise LinkClosed("closed")
+        self._go_nonblocking()
+        try:
+            return self.sock.send(data)
+        except (BlockingIOError, InterruptedError):
+            return 0
         except OSError as e:
             self.close()
             raise LinkClosed(str(e))
@@ -139,6 +197,7 @@ class SerialLink(Link):
             raise LinkClosed(str(e))
         self.port = port
         self._lock = threading.Lock()
+        self._nonblocking = False
 
     def read(self, timeout: float = 0.2) -> bytes:
         if self.closed:
@@ -161,6 +220,50 @@ class SerialLink(Link):
             raise LinkClosed("closed")
         try:
             self.port.write(data)
+        except Exception as e:
+            self.close()
+            raise LinkClosed(str(e) or type(e).__name__)
+
+    def fileno(self) -> Optional[int]:
+        if os.name != "posix" or self.closed:
+            return None  # Windows serial handles cannot be selected
+        try:
+            return self.port.fileno()
+        except Exception:
+            return None
+
+    def _fd(self) -> int:
+        fd = self.port.fileno()
+        if not self._nonblocking:
+            import fcntl
+
+            fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+            self._nonblocking = True
+        return fd
+
+    def read_nowait(self) -> bytes:
+        if self.closed:
+            raise LinkClosed("closed")
+        try:
+            data = os.read(self._fd(), 65536)
+        except (BlockingIOError, InterruptedError):
+            return b""
+        except Exception as e:  # EIO when the badge is unplugged
+            self.close()
+            raise LinkClosed(str(e) or type(e).__name__)
+        if not data:
+            # readable but empty: the device went away (pyserial treats it so too)
+            self.close()
+            raise LinkClosed("device disconnected")
+        return data
+
+    def write_nowait(self, data: bytes) -> int:
+        if self.closed:
+            raise LinkClosed("closed")
+        try:
+            return os.write(self._fd(), data)
+        except (BlockingIOError, InterruptedError):
+            return 0
         except Exception as e:
             self.close()
             raise LinkClosed(str(e) or type(e).__name__)

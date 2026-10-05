@@ -106,6 +106,54 @@ class TcpLobbyTest(unittest.TestCase):
         carts[0].wait_for(lambda m: frames.Pong(token=1) in m)
 
 
+class TcpOverflowTest(unittest.TestCase):
+    def test_stalled_socket_player_removed(self):
+        """A cart that stops reading is removed; the others lose nothing."""
+        import socket
+
+        from badge.links import SocketLink
+
+        logs = []
+        server = LobbyServer(Lobby(log=logs.append), log=logs.append, stats_interval=0, queue_limit=4096, stall_time=0.1)
+        a = FakeCart(game="G", name="a")
+        b = FakeCart(game="G", name="b")
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        # the stalled cart: accepts, says HELLO, then never reads
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        self.addCleanup(srv.close)
+        server.add_source(SimSource([(a.host, a.port), (b.host, b.port)], interval=0.1))
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.stop)
+        a.wait_for(lambda m: last_roster(m) is not None and len(last_roster(m)) == 2)
+        sock = socket.socket()
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        sock.connect(srv.getsockname())
+        stalled, _ = srv.accept()
+        self.addCleanup(stalled.close)
+        stalled.sendall(frames.encode(frames.Hello(game="G", name="stall").pack()))
+        server.add_link(SocketLink(sock, key="stall", label="stall"))
+        a.wait_for(lambda m: last_roster(m) is not None and len(last_roster(m)) == 3)
+        n = 0
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            for _ in range(50):
+                a.send(0xFF, bytes([n % 256]) * 240)
+                n += 1
+            time.sleep(0.02)
+            if last_roster(a.msgs) is not None and len(last_roster(a.msgs)) == 2:
+                break
+        self.assertEqual(len(last_roster(a.msgs)), 2, "stalled player was not removed")
+        b.wait_for(lambda m: len(data_of(m)) == n, timeout=10)
+        self.assertEqual([d[0] for _, d in data_of(b.msgs)], [i % 256 for i in range(n)])
+        self.assertTrue(any("not reading" in l for l in logs), logs)
+
+
 class CliLobbyTest(unittest.TestCase):
     def test_cli_lobby_runs_and_stops_cleanly(self):
         a = FakeCart(game="CLI", name="a")

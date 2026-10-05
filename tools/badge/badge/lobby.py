@@ -36,8 +36,9 @@ Protocol: fork/CART_SERIAL.md, "Lobby protocol v1". Three layers:
 
 from __future__ import annotations
 
-import collections
 import queue
+import selectors
+import socket
 import threading
 import time
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
@@ -278,11 +279,17 @@ class Lobby:
 
 
 # ---------------------------------------------------------------------------
-# Threads and links
+# Connections
 
 
 class Conn:
-    """One open link inside the server: reader + writer thread, out buffer."""
+    """One open link inside the server.
+
+    Selectable links (link.fileno() is not None: sockets, posix serial ports)
+    are read and written by the relay thread itself through its selector,
+    with non-blocking calls. Other links (Windows serial ports, test fakes)
+    get a reader and a writer thread that block in link.read / link.write.
+    """
 
     def __init__(self, cid: int, link: Link, server: "LobbyServer"):
         self.cid = cid
@@ -290,49 +297,91 @@ class Conn:
         self.key = link.key
         self.label = link.label or link.key
         self.server = server
-        self.cond = threading.Condition()
-        self.buf = bytearray()
         self.dead = False
         self.opened = time.time()
         self.bytes_in = 0
         self.bytes_out = 0
-        self.writing_since: Optional[float] = None  # set while link.write() runs
-        self.reader = threading.Thread(target=self._read_loop, name="rx " + self.label, daemon=True)
-        self.writer = threading.Thread(target=self._write_loop, name="tx " + self.label, daemon=True)
+        self.buf = bytearray()  # unsent bytes
+        self.blocked_since: Optional[float] = None  # a write has been stuck since then
+        try:
+            fd = link.fileno()
+        except Exception:
+            fd = None
+        self.fd: Optional[int] = fd
+        self.want_write = False
+        if fd is None:
+            self.cond = threading.Condition()
+            self.reader = threading.Thread(target=self._read_loop, name="rx " + self.label, daemon=True)
+            self.writer = threading.Thread(target=self._write_loop, name="tx " + self.label, daemon=True)
+
+    @property
+    def threaded(self) -> bool:
+        return self.fd is None
 
     def start(self) -> None:
-        self.reader.start()
-        self.writer.start()
+        if self.threaded:
+            self.reader.start()
+            self.writer.start()
 
     def queued(self) -> int:
         return len(self.buf)
 
+    def _overflowing(self, backlog: int) -> bool:
+        # Overflow = a backlog past the limit while one write has been stuck
+        # for stall_time (the cart stopped reading), or a backlog past the hard
+        # cap. A big burst to a player that keeps up is fine.
+        limit = self.server.queue_limit
+        if backlog <= limit:
+            return False
+        since = self.blocked_since
+        stalled = since is not None and time.monotonic() - since > self.server.stall_time
+        return stalled or backlog > 16 * limit
+
     def push(self, data: bytes) -> bool:
-        """Queue bytes for the writer. False when the queue limit is passed."""
-        with self.cond:
-            if self.dead:
-                return True
-            # Overflow = a backlog past the limit while one write has been
-            # blocked for stall_time (the cart stopped reading), or a backlog
-            # past the hard cap. A big burst to a player that keeps up is fine.
-            backlog = len(self.buf)
-            if backlog > self.server.queue_limit:
-                since = self.writing_since
-                stalled = since is not None and time.monotonic() - since > self.server.stall_time
-                if stalled or backlog > 16 * self.server.queue_limit:
+        """Queue bytes for the peer. False when the player must be dropped."""
+        if self.dead:
+            return True
+        if self.threaded:
+            with self.cond:
+                if self._overflowing(len(self.buf)):
                     return False
+                self.buf += data
+                self.cond.notify()
+            return True
+        if self._overflowing(len(self.buf)):
+            return False
+        if self.buf:
             self.buf += data
-            self.cond.notify()
+            return True
+        # fast path: nothing pending, write straight away
+        n = self.link.write_nowait(data)
+        self.bytes_out += n
+        if n < len(data):
+            self.buf += data[n:]
+            self.blocked_since = time.monotonic()
         return True
 
+    def on_writable(self) -> None:
+        """Selector says writable: send what is pending (relay thread)."""
+        if not self.buf:
+            return
+        n = self.link.write_nowait(bytes(self.buf))
+        if n:
+            del self.buf[:n]
+            self.bytes_out += n
+            self.blocked_since = time.monotonic() if self.buf else None
+
     def kill(self) -> None:
-        with self.cond:
-            self.dead = True
-            self.cond.notify()
+        self.dead = True
+        if self.threaded:
+            with self.cond:
+                self.cond.notify()
         self.link.close()
 
+    # -- threaded links --------------------------------------------------
+
     def _read_loop(self) -> None:
-        post = self.server.events.put
+        post = self.server.post
         try:
             while not self.dead:
                 data = self.link.read(0.2)
@@ -354,19 +403,21 @@ class Conn:
                         return
                     data = bytes(self.buf)
                     self.buf.clear()
-                    self.writing_since = time.monotonic()
+                    self.blocked_since = time.monotonic()
                 self.link.write(data)
-                self.writing_since = None
+                self.blocked_since = None
                 self.bytes_out += len(data)
         except LinkClosed as e:
-            self.server.events.put(("closed", self.cid, str(e) or "write failed"))
+            self.server.post(("closed", self.cid, str(e) or "write failed"))
         except Exception as e:
-            self.server.events.put(("closed", self.cid, "write error: %s" % e))
+            self.server.post(("closed", self.cid, "write error: %s" % e))
 
 
 class LobbyServer:
-    """Runs a Lobby over links. Thread-safe entry points: add_link,
-    remove_key, is_open, may_open, stop."""
+    """Runs a Lobby over links on one relay thread (`run`).
+
+    Thread-safe entry points: add_link, remove_key, is_open, may_open, stop.
+    """
 
     def __init__(
         self,
@@ -395,8 +446,21 @@ class LobbyServer:
         self.frames_out = 0
         self._last_stats = time.time()
         self._stats_prev: Dict[int, Tuple[int, int]] = {}
+        self._sel = selectors.DefaultSelector()
+        self._wake_r, self._wake_w = socket.socketpair()
+        self._wake_r.setblocking(False)
+        self._wake_w.setblocking(False)
+        self._sel.register(self._wake_r, selectors.EVENT_READ, None)
 
     # -- thread-safe API -------------------------------------------------
+
+    def post(self, ev: tuple) -> None:
+        """Queue an event for the relay thread and wake it."""
+        self.events.put(ev)
+        try:
+            self._wake_w.send(b"\x01")
+        except OSError:
+            pass  # buffer full means a wakeup is pending anyway; closed means stopping
 
     def add_source(self, source) -> None:
         self.sources.append(source)
@@ -430,18 +494,18 @@ class LobbyServer:
         if dup:
             link.close()
             return False
-        self.events.put(("link", cid, link))
+        self.post(("link", cid, link))
         return True
 
     def remove_key(self, key: str, reason: str) -> None:
         with self._lock:
             cid = self._keys.get(key)
         if cid is not None:
-            self.events.put(("closed", cid, reason))
+            self.post(("closed", cid, reason))
 
     def stop(self) -> None:
         self._stop.set()
-        self.events.put(("wake",))
+        self.post(("wake",))
 
     # -- relay thread ----------------------------------------------------
 
@@ -450,20 +514,34 @@ class LobbyServer:
             s.start(self)
         try:
             while not self._stop.is_set():
-                try:
-                    ev = self.events.get(timeout=0.5)
-                except queue.Empty:
-                    ev = None
-                n = 0
-                while ev is not None:
-                    self._handle(ev)
-                    n += 1
-                    if n >= 512:
-                        break
+                for key, mask in self._sel.select(0.5):
+                    c = key.data
+                    if c is None:
+                        try:
+                            while self._wake_r.recv(4096):
+                                pass
+                        except OSError:
+                            pass
+                        continue
+                    if c.dead:
+                        continue
+                    try:
+                        if mask & selectors.EVENT_READ:
+                            data = c.link.read_nowait()
+                            if data:
+                                c.bytes_in += len(data)
+                                self._feed(c, data)
+                        if mask & selectors.EVENT_WRITE and not c.dead:
+                            c.on_writable()
+                            self._update_interest(c)
+                    except LinkClosed as e:
+                        self._close(c.cid, str(e) or "port closed")
+                while True:
                     try:
                         ev = self.events.get_nowait()
                     except queue.Empty:
-                        ev = None
+                        break
+                    self._handle(ev)
                 self._flush()
                 if self.stats_interval and time.time() - self._last_stats >= self.stats_interval:
                     self._print_stats()
@@ -478,26 +556,45 @@ class LobbyServer:
             self.conns.clear()
             with self._lock:
                 self._keys.clear()
+            self._sel.close()
+            self._wake_r.close()
+            self._wake_w.close()
+
+    def _feed(self, c: Conn, data: bytes) -> None:
+        p = self.lobby.players.get(c.cid)
+        rx0 = p.rx if p else 0
+        self.lobby.feed(c.cid, data)
+        if p is not None:
+            self.frames_in += p.rx - rx0
+
+    def _update_interest(self, c: Conn) -> None:
+        want = bool(c.buf)
+        if want != c.want_write and not c.dead:
+            c.want_write = want
+            ev = selectors.EVENT_READ | (selectors.EVENT_WRITE if want else 0)
+            self._sel.modify(c.fd, ev, c)
 
     def _handle(self, ev: tuple) -> None:
         kind = ev[0]
         if kind == "rx":
             c = self.conns.get(ev[1])
             if c is not None:
-                before = self.lobby.players.get(c.cid)
-                rx0 = before.rx if before else 0
-                self.lobby.feed(c.cid, ev[2])
-                after = self.lobby.players.get(c.cid)
-                if after:
-                    self.frames_in += after.rx - rx0
+                self._feed(c, ev[2])
         elif kind == "link":
             cid, link = ev[1], ev[2]
             c = Conn(cid, link, self)
             self.conns[cid] = c
             self.lobby.connect(cid, c.label)
-            c.push(b"\x00")  # flush any partial frame on the cart side
+            if not c.threaded:
+                self._sel.register(c.fd, selectors.EVENT_READ, c)
             c.start()
             self.log("+ %s" % c.label)
+            try:
+                c.push(b"\x00")  # flush any partial frame on the cart side
+                if not c.threaded:
+                    self._update_interest(c)
+            except LinkClosed as e:
+                self._close(cid, str(e) or "port closed")
         elif kind == "closed":
             self._close(ev[1], ev[2])
 
@@ -506,6 +603,11 @@ class LobbyServer:
         if c is None:
             return
         self.lobby.disconnect(cid, reason)
+        if not c.threaded:
+            try:
+                self._sel.unregister(c.fd)
+            except (KeyError, ValueError, OSError):
+                pass
         c.kill()
         with self._lock:
             if self._keys.get(c.key) == cid:
@@ -514,21 +616,26 @@ class LobbyServer:
         self.log("- %s (%s)" % (c.label, reason))
 
     def _flush(self) -> None:
-        # Overflow removals generate ROSTERs, which need another pass.
+        # Removals generate ROSTERs, which need another pass.
         for _ in range(4):
             out = self.lobby.take_output()
             if not out:
                 return
-            over = []
+            drop = []
             for cid, data in out.items():
                 c = self.conns.get(cid)
                 if c is None:
                     continue
                 self.frames_out += data.count(0)
-                if not c.push(data):
-                    over.append(c)
-            for c in over:
-                self._close(c.cid, "not reading: %d bytes queued" % c.queued())
+                try:
+                    if not c.push(data):
+                        drop.append((c, "not reading: %d bytes queued" % c.queued()))
+                    elif not c.threaded:
+                        self._update_interest(c)
+                except LinkClosed as e:
+                    drop.append((c, str(e) or "port closed"))
+            for c, why in drop:
+                self._close(c.cid, why)
 
     def _print_stats(self) -> None:
         now = time.time()

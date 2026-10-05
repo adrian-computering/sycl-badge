@@ -39,7 +39,9 @@ import os
 import random
 import re
 import shutil
+import signal
 import socket
+import sys
 import subprocess
 import threading
 import time
@@ -237,6 +239,7 @@ class _Session(threading.Thread):
                     why = "no answer from hub: %s" % (e or type(e).__name__)
             if hub is None:
                 self.j._emit("disconnected", self.key, why)
+                self.j.hub_trouble()
                 self.stopping.wait(backoff)
                 backoff = min(backoff * 2, self.j.backoff_max)
                 continue
@@ -252,6 +255,8 @@ class _Session(threading.Thread):
             self.j._emit("disconnected", self.key, why)
             if why.startswith("port"):
                 return  # badge or simulator gone; the next scan may add it again
+            if why.startswith("hub"):
+                self.j.hub_trouble()
             self.stopping.wait(self.j.backoff_min)
 
     def _handshake(self, hub: Link, pinger: _Pinger) -> bytes:
@@ -349,6 +354,8 @@ class Joiner:
     """Links every local endpoint to the hub, one TCP stream each.
 
     connect():             a new Link to the hub (raises OSError/LinkClosed)
+    hub_trouble():         called when a session lost or could not reach the
+                           hub (TailcatTunnel restarts its tunnel)
     discover():            {key: descriptor} of local endpoints right now
     open_port(key, desc):  opens one endpoint as a Link (raises LinkClosed)
 
@@ -364,8 +371,10 @@ class Joiner:
                  scan_interval: float = 1.0,
                  backoff_min: float = 0.5, backoff_max: float = 8.0,
                  handshake: float = HANDSHAKE_S, heartbeat: float = HEARTBEAT_S,
-                 dead_after: float = DEAD_AFTER_S):
+                 dead_after: float = DEAD_AFTER_S,
+                 hub_trouble: Callable[[], None] = lambda: None):
         self.connect = connect
+        self.hub_trouble = hub_trouble
         self.discover = discover
         self.open_port = open_port
         self.on_event = on_event
@@ -425,6 +434,60 @@ def tcp_connector(host: str, port: int, timeout: float = 5.0) -> Callable[[], Li
     return connect
 
 
+class TailcatTunnel:
+    """`tailcat forward` to the hub, restarted when the hub is lost.
+
+    Restarting matters: a tailcat v0.7.0 forward client that had a connection
+    open when the server went away never reaches the restarted server (same
+    saved key) again, while a fresh client gets through at once. So every
+    hub_trouble() report restarts the forward, at most once per `min_age`.
+    """
+
+    def __init__(self, tc: "Tailcat", address: str, remote_port: int,
+                 log=lambda m: None, min_age: float = 5.0):
+        self.tc, self.address, self.remote_port = tc, address, remote_port
+        self.log = log
+        self.min_age = min_age
+        self.restarts = 0
+        self._lock = threading.Lock()
+        self._proc: Optional[TailcatProcess] = None
+        self._start()
+
+    def _start(self) -> None:
+        self._proc, self.host, self.port = self.tc.forward(self.address, self.remote_port)
+        self._started = time.monotonic()
+
+    def connect(self) -> Link:
+        with self._lock:
+            if self._proc is None or not self._proc.alive():
+                self._restart_locked("tailcat exited")
+            host, port = self.host, self.port
+        return SocketLink.connect(host, port, key="hub", label="hub", timeout=5.0)
+
+    def trouble(self) -> None:
+        with self._lock:
+            if time.monotonic() - self._started >= self.min_age:
+                self._restart_locked("hub lost")
+
+    def _restart_locked(self, why: str) -> None:
+        if self._proc is not None:
+            self._proc.close()
+        self.restarts += 1
+        self.log("restarting the tailcat tunnel (%s)" % why)
+        try:
+            self._start()
+        except TailcatError as e:
+            self._proc = None
+            self._started = time.monotonic()
+            raise LinkClosed(str(e))
+
+    def close(self) -> None:
+        with self._lock:
+            if self._proc is not None:
+                self._proc.close()
+                self._proc = None
+
+
 # ----------------------------------------------------------------- tailcat
 
 
@@ -453,7 +516,8 @@ class TailcatProcess:
         self.argv = argv
         self.proc = subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE, text=True, errors="replace")
+            stderr=subprocess.PIPE, text=True, errors="replace",
+            preexec_fn=_die_with_parent if sys.platform.startswith("linux") else None)
         self.lines: list[str] = []
         self._match: Optional[re.Match] = None
         self._found = threading.Event()
@@ -488,9 +552,22 @@ class TailcatProcess:
         if self.proc.poll() is None:
             self.proc.terminate()
             try:
-                self.proc.wait(3)
+                self.proc.wait(1)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
+                self.proc.kill()  # `tailcat forward` ignores SIGTERM
+                self.proc.wait(3)
+
+
+def _die_with_parent() -> None:
+    """Linux: kill the tailcat child if we die, even by SIGKILL, so no orphan
+    keeps serving (or forwarding to) a dead lobby. SIGKILL because `tailcat
+    forward` ignores SIGTERM (v0.7.0)."""
+    try:
+        import ctypes
+
+        ctypes.CDLL(None).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+    except Exception:
+        pass
 
 
 class Tailcat:
@@ -543,6 +620,19 @@ class Tailcat:
 # ------------------------------------------------------------- CLI glue
 
 
+def interrupt_on_terminate() -> None:
+    """Treat SIGTERM / SIGHUP (kill, closed terminal) like Ctrl-C, so the
+    cleanup that stops tailcat runs. Main thread only."""
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), interrupt)
+
+
 def join_hint(address: str, port: int = DEFAULT_PORT) -> str:
     extra = "" if port == DEFAULT_PORT else " --remote-port %d" % port
     return "others join with:  badge join %s%s" % (address, extra)
@@ -575,6 +665,7 @@ def start_lobby_network(args, server, log) -> Callable[[], None]:
     log("listening for `badge join` on %s:%d" % (src.host, src.port))
     tunnel = None
     if args.tailcat:
+        interrupt_on_terminate()
         if src.host not in ("127.0.0.1", "0.0.0.0", "::", "::1", "localhost"):
             log("! tailcat connects to localhost:%d, but --listen is bound to %s only" % (src.port, src.host))
         try:
@@ -648,10 +739,11 @@ def cmd_join(args, log=None, stop: Optional[threading.Event] = None) -> int:
     stop = stop or threading.Event()
     target = args.target.strip()
     tunnel = None
+    interrupt_on_terminate()
     if is_tailcat_address(target):
         try:
             tc = Tailcat(args.tailcat_bin)
-            tunnel, host, port = tc.forward(target, args.remote_port)
+            tunnel = TailcatTunnel(tc, target, args.remote_port, log)
         except (TailcatMissing, TailcatError) as e:
             log("badge: %s" % e)
             return 2
@@ -660,9 +752,11 @@ def cmd_join(args, log=None, stop: Optional[threading.Event] = None) -> int:
             log("tailcat path: %s" % tc.path(target))
         threading.Thread(target=report_path, daemon=True).start()
         where = "tailcat " + target[:12] + "..."
+        connect, trouble = tunnel.connect, tunnel.trouble
     else:
         host, port = parse_hostport(target, default_host=target)
         where = "%s:%d" % (host, port)
+        connect, trouble = tcp_connector(host, port), lambda: None
 
     def on_event(e: JoinerEvent) -> None:
         text = {"added": "found", "connected": "in the lobby", "disconnected": "waiting for hub",
@@ -670,10 +764,10 @@ def cmd_join(args, log=None, stop: Optional[threading.Event] = None) -> int:
         log("%s: %s%s" % (e.key, text, " (%s)" % e.detail if e.detail else ""))
 
     joiner: Optional[Joiner] = None
-    joiner = Joiner(tcp_connector(host, port),
+    joiner = Joiner(connect,
                     local_endpoints(args, lambda: joiner.active() if joiner else set()),
                     lambda key, url: open_link(url, key=key, label=key, timeout=0.5),
-                    on_event)
+                    on_event, hub_trouble=trouble)
     log("joining the lobby at %s; Ctrl-C stops" % where)
     try:
         joiner.run(stop)

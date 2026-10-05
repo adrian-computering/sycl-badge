@@ -159,6 +159,42 @@ any number of rooms and games at once.
   is removed once this much output is waiting, so it never holds up the others
   and nobody loses frames.
 - `-v`: log every message.
+- `--listen [ADDR:]PORT`: also take players from `badge join` on other
+  computers (default `127.0.0.1:7360`; `0.0.0.0:7360` opens it to the LAN).
+- `--tailcat`: serve that port over [tailcat](https://github.com/tailscale/tailcat)
+  and print the `badge join tc...` line to send the others (implies
+  `--listen`). Each run gets a new address; `--tailcat-key NAME` uses a key
+  saved with `tailcat genkey --key=NAME`, so the address survives restarts.
+
+### `badge join TARGET`
+
+Puts this computer's badges and simulators in a lobby that runs on another
+computer (fork/NET_LOBBY.md). TARGET is the hub's tailcat address
+(`tc...`, printed by `badge lobby --tailcat`) or `HOST[:PORT]` for a hub
+on the same network or tailnet with `--listen 0.0.0.0`. Each local badge
+gets its own connection to the hub, so the hub sees one player per badge,
+exactly as if it were plugged in there.
+
+```
+12:00:01 joining the lobby at tailcat tcpGFwWCBgaP...; Ctrl-C stops
+12:00:01 usb:E4637C9C1B6A2B21: found
+12:00:02 usb:E4637C9C1B6A2B21: in the lobby
+12:00:02 tailcat path: direct via 203.0.113.7:41641, 18ms
+```
+
+A badge's cart port opens only once the hub has answered through the new
+connection, so while the hub is unreachable the cart shows "waiting for
+host"; it rejoins by itself when the hub comes back (with a fresh tailcat
+address only if you passed `--tailcat-key` on the hub). The joiner PINGs a
+quiet hub every 3 s and drops the link after 10 s without an answer.
+`--sim`, `--no-sim`, `--no-usb` and `--port` work as for `badge lobby`;
+`--remote-port N` when the hub listens on a port other than 7360.
+
+Tailcat: open source, no account, WireGuard end to end, direct
+peer-to-peer after NAT traversal, falling back to Tailscale's free relays.
+Install it on every computer (`brew install tailcat`, `scoop install
+tailcat`, or a release binary). Anyone with the address can join, so share
+it only with the players.
 
 Performance (`python3 tools/badge/bench_lobby.py`, 16 fake carts over
 localhost TCP at 60 Hz with 6-byte payloads): 960 frames/s in, 14,400/s out,
@@ -215,6 +251,8 @@ for body in decoder.feed(link.read(1.0)):
 - `discover`: `scan()`, `Badge`, `select()`, simulator probing.
 - `links`: `Link` (read / write / close, plus an optional non-blocking
   selector path), `SerialLink`, `SocketLink`, `open_link`.
+- `net`: `ListenSource` (remote players for a `LobbyServer`), `Joiner`,
+  `Tailcat` (see the module docstring).
 - `lobby`: `Lobby` (the protocol state machine, no I/O) and `LobbyServer`.
   Anything that produces `Link`s can feed the relay: a source is an object
   with `start(server)` and `stop()` that calls `server.add_link(link)` and
@@ -230,3 +268,5 @@ python3 tools/badge/bench_lobby.py            # relay throughput and latency
 The tests need no hardware: canned USB data for macOS, Linux and Windows,
 fake drives and boot loader, a pseudo terminal standing in for a serial port,
 and fake simulator carts over localhost TCP.
+`BADGE_TEST_TAILCAT=1` adds an end-to-end test through real tailcat
+(needs tailcat installed and internet access).

@@ -71,6 +71,11 @@ badge install zig-out/carts/lobby-demo.uf2 --all        # a cart on every badge
 badge lobby                     # run the relay; badges join as they connect
 ```
 
+Badges on other computers can join the same lobby, over a LAN or the
+internet: run `badge lobby --tailcat` on one computer and the
+`badge join tc...` line it prints on the others ([NET_LOBBY.md](NET_LOBBY.md),
+`badge join` in tools/badge/README.md). Nothing changes on the badge.
+
 ## USB layout (fork firmware)
 
 The badge is one composite USB device:

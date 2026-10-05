@@ -183,9 +183,11 @@ class NetLobbyTest(unittest.TestCase):
         dead = s.getsockname()[1]
         s.close()
         a = self.cart(name="a")
-        self.join(dead, [a])
+        troubles = []
+        self.join(dead, [a], hub_trouble=lambda: troubles.append(1))
         time.sleep(0.5)
         self.assertEqual(a.connections, 0)
+        self.assertGreater(len(troubles), 0, "a lost hub is reported (tailcat tunnels restart)")
 
     def test_tunnel_up_but_hub_down_keeps_port_closed(self):
         # tailcat's local end accepts even when the hub is gone; the handshake catches it
@@ -257,6 +259,9 @@ FAKE_TAILCAT = r"""#!/usr/bin/env python3
 import os, sys, time
 mode = os.environ.get("FAKE_TAILCAT_MODE", "ok")
 cmd = sys.argv[1]
+if os.environ.get("FAKE_TAILCAT_LOG"):
+    with open(os.environ["FAKE_TAILCAT_LOG"], "a") as f:
+        f.write(cmd + "\n")
 if mode == "die":
     print("2026/10/05 boom: no DERP", file=sys.stderr); sys.exit(1)
 if cmd == "serve":
@@ -335,6 +340,31 @@ class TailcatTest(unittest.TestCase):
             os.environ["PATH"] = old_path
             if old_home is not None:
                 os.environ["HOME"] = old_home
+
+    def test_tunnel_restarts_on_trouble(self):
+        logf = os.path.join(self.dir.name, "calls")
+        os.environ["FAKE_TAILCAT_LOG"] = logf
+        os.environ["FAKE_TAILCAT_LOCAL"] = "43303"
+        logs = []
+        try:
+            t = net.TailcatTunnel(net.Tailcat(self.bin), ADDR, 7360, logs.append, min_age=0.3)
+            t.trouble()  # too soon after start: ignored (many sessions report at once)
+            self.assertEqual(t.restarts, 0)
+            time.sleep(0.35)
+            t.trouble()
+            t.trouble()
+            self.assertEqual(t.restarts, 1)
+            t._proc.close()  # tailcat died: the next connect starts a new one
+            with self.assertRaises(OSError):
+                t.connect()  # nothing listens on the fake local port
+            self.assertEqual(t.restarts, 2)
+            t.close()
+            self.assertIsNone(t._proc)
+            with open(logf) as f:
+                self.assertEqual(f.read().split(), ["forward"] * 3)
+            self.assertTrue(any("restarting the tailcat tunnel" in l for l in logs))
+        finally:
+            del os.environ["FAKE_TAILCAT_LOG"]
 
     def test_lobby_flags_print_join_line(self):
         server = argparse.Namespace(add_source=lambda src: None)

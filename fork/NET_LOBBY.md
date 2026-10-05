@@ -92,16 +92,31 @@ as it is. Networking lives entirely in the `badge` host tool.
 
 ## Status
 
-- 2026-10-05: plan written; tailcat verified on the VM.
-- 2026-10-05: `tools/badge/badge/net.py` (Listener, Joiner, Tailcat,
-  `join_command`, `start_hub_tailcat`) and `tools/badge/tests/test_net.py`
-  are done. 14 unit tests with fake hub, ports and tailcat; 15/15 clean runs.
-  The opt-in `BADGE_TEST_TAILCAT=1` test passes over real tailcat v0.7.0 (two
-  joined endpoints, both directions, path "direct via 10.42.0.42, 5.8ms").
-  Left for N0/N1: wiring `--listen` / `--tailcat` into `lobby.py` (a link
-  source fed by `Listener.accept`) and `badge join` into the CLI with real
-  discovery/SerialLink. That waits for the cart-serial host track (exedev-94
-  messages exedev-06 when M1-C lands). N2 follows.
+- 2026-10-05: plan written; tailcat v0.7.0 verified on the VM.
+- 2026-10-05: N0 + N1 + N2 DONE on `feature/net-lobby`.
+  - `badge lobby --listen [ADDR:]PORT --tailcat [--tailcat-key NAME]` and
+    `badge join TARGET` (tools/badge/badge/net.py; cli.py only gains three
+    hook lines). Remote players are `SocketLink`s from a `ListenSource`, so
+    they get the relay's ordering and no-silent-loss rules unchanged.
+  - Joiner details beyond the plan: a PING/PONG handshake before a cart
+    port opens (tailcat's local end accepts even when the hub is down), a
+    heartbeat PING after 3 s of hub silence with the joiner's own PONGs
+    filtered out (10 s without an answer drops the link), SIGTERM/SIGHUP act
+    as Ctrl-C, and the tailcat child dies with us on Linux (PR_SET_PDEATHSIG).
+  - tailcat v0.7.0 quirks found and handled: `tailcat forward` ignores
+    SIGTERM (we escalate to SIGKILL); a forward client that had a connection
+    open when the server died never reaches the restarted server again, so
+    `TailcatTunnel` restarts the forward on every lost hub (at most every 5 s).
+  - Tests: 22 in tools/badge/tests/test_net.py (real LobbyServer, FakeCart
+    simulators, fake tailcat binary); full suite 127 pass. Opt-in
+    `BADGE_TEST_TAILCAT=1` end to end through real tailcat passes.
+  - N2 on the VM with real `lobby-demo` simulators (SDL dummy drivers): two
+    on the hub + two through `badge join tc...` all in DOTS room 1, 2/4
+    frames/s in/out each, path direct. Hub SIGTERM + restart on a saved key:
+    the joiner noticed in 13 s, restarted its tunnel, both back in 1 s.
+    Joiner SIGTERM: hub logs both leaves. Hub SIGKILL: no tailcat left over.
+  - Untested: real badges, two physical computers behind different NATs
+    (tailcat via DERP), macOS/Windows joiners.
 
 ## Deferred questions (defaults taken)
 

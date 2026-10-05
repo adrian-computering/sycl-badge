@@ -200,7 +200,8 @@ class MacTest(unittest.TestCase):
         }
         hub = {"IOObjectClass": "IOUSBHostDevice", "idVendor": 0x05AC, "idProduct": 1, "locationID": 0x14000000,
                "IORegistryEntryChildren": []}
-        return plistlib.dumps([hub, badge, upstream])
+        hub_with_child = dict(hub, IORegistryEntryChildren=[{"IOObjectClass": "AppleUSB20HubPort", "IORegistryEntryChildren": [badge]}])
+        return plistlib.dumps([hub_with_child, badge, upstream])
 
     def test_parse_ioreg(self):
         devs = discover.parse_ioreg(self.ioreg_plist())

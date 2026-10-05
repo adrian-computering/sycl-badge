@@ -418,7 +418,15 @@ def parse_ioreg(data: bytes) -> List[UsbDev]:
 
     for n in root:
         walk(n, None, None)
-    return devices
+    # hubs nest their devices, so a device can show up twice; keep the
+    # entry with the most detail
+    unique: Dict[Tuple[str, Optional[str]], UsbDev] = {}
+    for d in devices:
+        k = (d.location, d.serial)
+        old = unique.get(k)
+        if old is None or len(d.ttys) + len(d.disks) > len(old.ttys) + len(old.disks):
+            unique[k] = d
+    return list(unique.values())
 
 
 def scan_ioreg() -> List[UsbDev]:
@@ -477,6 +485,7 @@ def windows_volumes() -> List[Volume]:
         import string
 
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        kernel32.SetErrorMode(1)  # SEM_FAILCRITICALERRORS: no "insert a disk" dialogs
         mask = kernel32.GetLogicalDrives()
         for i, letter in enumerate(string.ascii_uppercase):
             if not mask & (1 << i):

@@ -170,7 +170,10 @@ about 0.2 ms median and 5-7 ms 99th percentile relay latency, 8% of one core.
 `/Volumes/SYCLBADGE 1`, ... when several badges are plugged in. The tool reads
 `ioreg` to tell the console port from the cart port and to match each drive to
 its badge. macOS may warn that a disk was not ejected properly after a
-firmware flash; that is expected (the badge reboots).
+firmware flash; that is expected (the badge reboots). The badge drive has
+room for 32 root directory entries and macOS's hidden folders (`.fseventsd`,
+`.Spotlight-V100`, `.Trashes`) take several of them; if `badge install` reports
+a full drive with space left, delete old carts.
 
 **Linux.** Ports are `/dev/ttyACM*` (stable names:
 `/dev/serial/by-id/usb-*_SYCL_Badge_V2_<serial>-if01` for the console, `-if03`

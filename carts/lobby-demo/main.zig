@@ -261,7 +261,7 @@ fn draw_roster() void {
         cart.text(.{ .str = my_name, .x = panel_x + 4, .y = panel_y + 18, .text_color = fg });
         return;
     }
-    cart.text(.{ .str = "ROSTER    A: close", .x = panel_x + 4, .y = panel_y + 3, .text_color = dim });
+    cart.text(.{ .str = "ROSTER    A=close", .x = panel_x + 4, .y = panel_y + 3, .text_color = dim });
 
     // Two columns of eight.
     const me = lobby.you().?;

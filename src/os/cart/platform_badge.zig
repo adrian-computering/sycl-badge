@@ -551,7 +551,11 @@ inline fn dmb() void {
 }
 
 pub fn serial_supported() bool {
-    return ipc_data.os_flags.cart_serial_supported;
+    if (!ipc_data.os_flags.cart_serial_supported) return false;
+    // The OS zeroes cart_serial at cart start, so anything else there before
+    // we open means bit 1 belongs to other firmware (ext-flash e2.2 and
+    // older put the flash size in this word).
+    return serial_open_flag or ipc_data.cart_serial == null;
 }
 
 pub fn serial_open(rx: []u8, tx: []u8) error{Unsupported}!void {

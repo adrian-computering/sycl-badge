@@ -75,7 +75,10 @@ pub const CartIPCData = extern struct {
         os_clear_supported: bool,
         /// Fork firmware: the OS serves `cart_serial` (see CartSerialRings).
         cart_serial_supported: bool = false,
-        _reserved: u14 = 0,
+        /// Taken by ext-flash firmware (bit 2 ext_flash, bits 3-4 ext_volume),
+        /// see fork/ABI.md.
+        _ext_flash_flags: u3 = 0,
+        _reserved: u11 = 0,
     },
 
     cart_dma_channels: u16,            // x150EC..x150EE
@@ -84,7 +87,9 @@ pub const CartIPCData = extern struct {
     /// Fork firmware: the cart's serial rings, null while the port is closed.
     /// Written by the cart, cleared by the OS at cart start and stop.
     cart_serial: ?*CartSerialRings,    // x150F4..x150F8
-    _reserved: [2]u32 = @splat(0),     // x150F8..x15100
+    /// Taken by ext-flash firmware (size and cart offset in KB, boot diag),
+    /// see fork/ABI.md. The IPC block has no spare words left.
+    _ext_flash: [2]u32 = @splat(0),    // x150F8..x15100
 
     comptime {
         // badge_cart.ld reserves 0x15100 bytes for IPC data.

@@ -120,7 +120,10 @@ built with other SDKs (for example a pinned older `sycl-badge`) that want to
 talk to the port directly. Defined in `src/os/cart/os_abi.zig`.
 
 - `ipc_data.os_flags` (u16 at `0x200350EA`) bit 1 = `cart_serial_supported`.
-  Stock firmware leaves it 0.
+  Stock firmware leaves it 0. Treat the port as supported only if bit 1 is set
+  **and** `cart_serial` reads 0 before you open: ext-flash firmware e2.2 and
+  earlier also set bit 1 and keep the flash size in that word. Other fork
+  allocations are in [ABI.md](ABI.md).
 - `ipc_data.cart_serial` (u32 at `0x200350F4`) = address of a
   `CartSerialRings` in cart RAM, or 0 when closed. The OS zeroes it when a cart
   starts and when it stops.

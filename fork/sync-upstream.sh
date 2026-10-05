@@ -66,7 +66,8 @@ branch_dir() {
 check() { # check <branch> <dir>
   if [[ $BUILD == 1 ]]; then
     echo "  building and testing $1"
-    (cd "$2" && "$ZIG" build >/dev/null && "$ZIG" build test >/dev/null) || {
+    (cd "$2" && "$ZIG" build >/dev/null && "$ZIG" build test >/dev/null &&
+      { [[ ! -d tools/badge/tests ]] || python3 -m unittest discover -q tools/badge/tests 2>/dev/null; }) || {
       echo "error: build or tests failed on $1 (in $2)" >&2
       exit 1
     }

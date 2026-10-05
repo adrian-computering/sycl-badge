@@ -60,7 +60,7 @@ ID (90h), 03h data and a 64 KB speed test through window 1. Hardware result pend
 
 ### E3 — later / deferred
 - Quad reads (QE bit via direct mode at boot) if the 0Bh speed is not enough.
-- Cart write API (saves) through a mailbox request to core 0.
+- (Cart write API moved into E1: cart.ext_flash_erase/program on the last 256 KB.)
 - Monorepo: romfs reader + emulator ROM pickers scan the extra volume.
 
 ## Deferred questions (defaults taken)

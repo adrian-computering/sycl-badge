@@ -64,6 +64,21 @@ pub fn build(b: *Build) void {
         .asserts = true,
     });
 
+    // Firmware version for the console's `id` command: `git describe` at build
+    // time, "unknown" outside a git checkout
+    const git_version = b.addRunArtifact(b.addExecutable(.{
+        .name = "git_version",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/git_version.zig"),
+            .target = b.graph.host,
+        }),
+    }));
+    git_version.setCwd(b.path("."));
+    git_version.has_side_effects = true;
+    kernel.exe.root_module.addAnonymousImport("firmware_version", .{
+        .root_source_file = git_version.captureStdOut(.{ .basename = "firmware_version.zig" }),
+    });
+
     // Install both ELF and UF2 formats
     const install_uf2 = mb.add_install_firmware(kernel, .{ .format = .{ .uf2 = .{ .family_id = .RP2350_ARM_S } } });
     const install_elf = mb.add_install_firmware(kernel, .{ .format = .elf });

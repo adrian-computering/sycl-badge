@@ -67,6 +67,27 @@ pub fn supports_os_clear() bool {
     return false;
 }
 
+pub fn ext_flash() ?[]const u8 {
+    return null;
+}
+
+pub fn ext_flash_cart_offset() u32 {
+    return 0;
+}
+
+pub fn ext_flash_diag() u32 {
+    return 0;
+}
+
+pub fn ext_flash_volume() u8 {
+    return 0;
+}
+
+pub fn ext_flash_request(op: cart_api.ExtFlashOp, offset: u32, src: u32, len: u32) cart_api.ExtFlashStatus {
+    _ = .{ op, offset, src, len };
+    return .unsupported;
+}
+
 // ┌───────────────────────────────────────────────────────────────────────────┐
 // │                                                                           │
 // │ Sound Functions                                                           │

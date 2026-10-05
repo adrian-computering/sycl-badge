@@ -7,6 +7,7 @@ const timer = @import("../drivers/timer.zig");
 const gpio = @import("../drivers/gpio.zig");
 const lcd = @import("../drivers/lcd.zig");
 const rom = @import("../drivers/rom.zig");
+const ext_flash = @import("../drivers/ext_flash.zig");
 const rtt = @import("../drivers/rtt.zig");
 const mailbox = @import("../ipc/mailbox.zig");
 const shared_mem = @import("../ipc/shared_mem.zig");
@@ -156,6 +157,7 @@ const commands = [_]Command{
     .{ .name = "cart", .description = "Manage carts (list/run/stop/info/delete/wipeall)", .handler = cmdCart, .completion_provider = cartCompletions },
     .{ .name = "overlay", .description = "LCD overlay controls (overlay fps [on|off])", .handler = cmdOverlay, .completion_provider = overlayCompletions },
     .{ .name = "storage", .description = "Show storage filesystem statistics", .handler = cmdStorage },
+    .{ .name = "extflash", .description = "External QSPI flash (info/read <hex off> [len]/test confirm)", .handler = cmdExtFlash },
     .{ .name = "wipe", .description = "Erase cart XIP flash and process RAM (wipe confirm)", .handler = cmdWipe },
     .{ .name = "menu", .description = "Return to cart selection screen", .handler = cmdMenu },
     .{ .name = "reboot", .description = "Restart the system (reboot [bootsel])", .handler = cmdReboot, .completion_provider = rebootCompletions },
@@ -967,14 +969,21 @@ fn cmdGpioList(iter: *std.mem.TokenIterator(u8, .scalar)) void {
 // Storage Statistics Command - Show filesystem details
 fn cmdStorage(iter: *std.mem.TokenIterator(u8, .scalar)) void {
     _ = iter;
+    var index: u8 = 0;
+    while (index < storage.volumeCount()) : (index += 1) {
+        printStorageStats(index);
+    }
+}
 
-    println("\r\n=== Storage Filesystem Statistics ===\r\n");
+fn printStorageStats(index: u8) void {
+    const volume = storage.volume(index);
+    printf("\r\n=== Storage Filesystem Statistics: {s} (LUN {d}) ===\r\n\r\n", .{ volume.label, index });
 
-    const stats = storage.getStats();
+    const stats = storage.getStats(volume);
 
     // Overall filesystem info
-    printf("Total Storage:     {d} KB ({d} bytes)\r\n", .{ stats.total_size_bytes / 1024, stats.total_size_bytes });
-    printf("FAT12 Filesystem:  {d} sectors x 512 bytes\r\n\r\n", .{storage.totalSectors()});
+    printf("Total Storage:     {d} KB ({d} bytes) at 0x{X}\r\n", .{ stats.total_size_bytes / 1024, stats.total_size_bytes, volume.base });
+    printf("FAT12 Filesystem:  {d} sectors x 512 bytes\r\n\r\n", .{storage.totalSectors(volume)});
 
     // Filesystem layout
     println("--- Filesystem Layout ---");
@@ -1015,6 +1024,108 @@ fn cmdStorage(iter: *std.mem.TokenIterator(u8, .scalar)) void {
     } else {
         println("");
     }
+}
+
+// External flash command - inspect and self-test the U8 QSPI flash on CS1
+// Static: the console runs on the 4 KB main stack.
+var ext_test_buf: [ext_flash.sector_size]u8 align(4) = undefined;
+var ext_saved_buf: [ext_flash.sector_size]u8 align(4) = undefined;
+
+fn cmdExtFlash(iter: *std.mem.TokenIterator(u8, .scalar)) void {
+    const info = ext_flash.getInfo() orelse {
+        println("\r\nExternal flash: not detected (no SFDP answer on QMI CS1 / GPIO0)\r\n");
+        return;
+    };
+    const subcmd = iter.next() orelse "info";
+
+    if (std.mem.eql(u8, subcmd, "info")) {
+        printf("\r\nExternal flash: {d} KB at 0x{X:0>8} (uncached 0x{X:0>8})\r\n", .{ info.size / 1024, ext_flash.base, ext_flash.base_nocache });
+        printf("  ID {X:0>2} {X:0>2}, SFDP {d}.{d}\r\n", .{ info.manufacturer, info.device, info.sfdp_major, info.sfdp_minor });
+        const qmi: [*]const volatile u32 = @ptrFromInt(0x400D0000);
+        printf("  QMI M0 timing {X:0>8} rfmt {X:0>8} rcmd {X:0>8}\r\n", .{ qmi[3], qmi[4], qmi[5] });
+        printf("  QMI M1 timing {X:0>8} rfmt {X:0>8} rcmd {X:0>8}\r\n\r\n", .{ qmi[8], qmi[9], qmi[10] });
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "read")) {
+        const off_str = iter.next() orelse {
+            println("\r\nUsage: extflash read <hex offset> [len]\r\n");
+            return;
+        };
+        const offset = std.fmt.parseInt(u32, off_str, 16) catch {
+            println("\r\nBad offset\r\n");
+            return;
+        };
+        const len_req = if (iter.next()) |s| std.fmt.parseInt(u32, s, 0) catch 64 else 64;
+        if (offset >= info.size) {
+            println("\r\nOffset past end of chip\r\n");
+            return;
+        }
+        const len = @min(len_req, 512, info.size - offset);
+        const mem: [*]const volatile u8 = @ptrFromInt(ext_flash.base_nocache + offset);
+        println("");
+        var i: u32 = 0;
+        while (i < len) : (i += 16) {
+            var line: [80]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&line);
+            w.print("{X:0>6}:", .{offset + i}) catch {};
+            var j: u32 = 0;
+            while (j < 16 and i + j < len) : (j += 1) w.print(" {X:0>2}", .{mem[i + j]}) catch {};
+            w.writeAll("\r\n") catch {};
+            print(w.buffered());
+        }
+        println("");
+        return;
+    }
+
+    if (std.mem.eql(u8, subcmd, "test")) {
+        const confirm = iter.next();
+        if (confirm == null or !std.mem.eql(u8, confirm.?, "confirm")) {
+            println("\r\nRewrites the last 4 KB sector (contents saved and restored).");
+            println("To proceed, type: extflash test confirm\r\n");
+            return;
+        }
+        if (loader.getState() == .running or loader.getState() == .ready) {
+            println("\r\nStop the running cart first (cart stop)\r\n");
+            return;
+        }
+        extFlashSelfTest(info.size - ext_flash.sector_size);
+        return;
+    }
+
+    println("\r\nUsage: extflash [info|read <hex off> [len]|test confirm]\r\n");
+}
+
+fn extFlashSelfTest(offset: u32) void {
+    const mem: [*]const volatile u8 = @ptrFromInt(ext_flash.base_nocache + offset);
+    const n = ext_flash.sector_size;
+    const saved = &ext_saved_buf;
+    for (saved, 0..) |*b, i| b.* = mem[i];
+
+    printf("\r\nSelf-test of sector 0x{X:0>6}\r\n", .{offset});
+    const t0 = timer.micros();
+    ext_flash.erase(offset, n) catch |e| return printf("  erase failed: {s}\r\n", .{@errorName(e)});
+    const t1 = timer.micros();
+    var bad: u32 = 0;
+    for (0..n) |i| bad += @intFromBool(mem[i] != 0xFF);
+    printf("  erase {d} us, {d} bytes not FF\r\n", .{ t1 - t0, bad });
+
+    for (&ext_test_buf, 0..) |*b, i| b.* = @truncate(i *% 7 +% (i >> 8) +% 0x5A);
+    ext_flash.program(offset, &ext_test_buf) catch |e| return printf("  program failed: {s}\r\n", .{@errorName(e)});
+    const t2 = timer.micros();
+    bad = 0;
+    for (0..n) |i| bad += @intFromBool(mem[i] != ext_test_buf[i]);
+    printf("  program {d} us, {d} bytes wrong\r\n", .{ t2 - t1, bad });
+    const cached: [*]const u8 = @ptrFromInt(ext_flash.base + offset);
+    const cached_ok = std.mem.eql(u8, cached[0..n], &ext_test_buf);
+    printf("  cached window {s}\r\n", .{if (cached_ok) "matches" else "MISMATCH"});
+
+    ext_flash.erase(offset, n) catch {};
+    ext_flash.program(offset, saved) catch {};
+    var restored: u32 = 0;
+    for (0..n) |i| restored += @intFromBool(mem[i] == saved[i]);
+    printf("  restored {d}/{d} bytes\r\n", .{ restored, n });
+    println(if (bad == 0 and cached_ok and restored == n) "PASS\r\n" else "FAIL\r\n");
 }
 
 // Wipe Command - Erase cart/XIP flash and process RAM

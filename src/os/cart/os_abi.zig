@@ -75,9 +75,12 @@ pub const CartIPCData = extern struct {
         os_clear_supported: bool,
         /// Fork firmware: the OS serves `cart_serial` (see CartSerialRings).
         cart_serial_supported: bool = false,
-        /// Taken by ext-flash firmware (bit 2 ext_flash, bits 3-4 ext_volume),
-        /// see fork/ABI.md.
-        _ext_flash_flags: u3 = 0,
+        /// The external QSPI flash is mapped read-only at ext_flash_base
+        /// (fork/EXT_FLASH.md).
+        ext_flash: bool = false,
+        /// What boot did with the external drive: 0 none, 1 kept,
+        /// 2 formatted, 3 reads unstable so not mounted.
+        ext_volume: u2 = 0,
         _reserved: u11 = 0,
     },
 
@@ -87,9 +90,9 @@ pub const CartIPCData = extern struct {
     /// Fork firmware: the cart's serial rings, null while the port is closed.
     /// Written by the cart, cleared by the OS at cart start and stop.
     cart_serial: ?*CartSerialRings,    // x150F4..x150F8
-    /// Taken by ext-flash firmware (size and cart offset in KB, boot diag),
-    /// see fork/ABI.md. The IPC block has no spare words left.
-    _ext_flash: [2]u32 = @splat(0),    // x150F8..x15100
+    ext_flash_size_kb: u16 = 0,        // x150F8..x150FA, KB at ext_flash_base when os_flags.ext_flash
+    ext_flash_cart_offset_kb: u16 = 0, // x150FA..x150FC, start of the cart-writable area in KB (to the end)
+    ext_flash_diag: u32 = 0,           // x150FC..x15100, boot detection result (0 = OS without ext-flash support)
 
     comptime {
         // badge_cart.ld reserves 0x15100 bytes for IPC data.
@@ -144,6 +147,9 @@ pub const CartSerialStatus = packed struct(u32) {
     _reserved: u30 = 0,
 };
 
+/// Cached XIP address of the external flash (QMI window 1).
+pub const ext_flash_base: usize = 0x11000000;
+
 // Mailbox messages
 // zig fmt: off
 /// Cart trace (debug) messages: type 0x26, payload = length.
@@ -168,7 +174,28 @@ pub const OS_ACK_STOP_AUDIO    : u32 = 0x29000003;
 pub const SYNC_TIME_REQ_CLR    : u32 = 0x2a000001;
 pub const SYNC_TIME_ACK_CLR    : u32 = 0x2a000002;
 pub const SYNC_TIME_REQ_TIME   : u32 = 0x2a000003;
+
+/// External flash write request, cart -> OS. Payload = word offset of an
+/// ExtFlashRequest in cart RAM from 0x20000000. The cart must then wait for
+/// EXT_FLASH_DONE without touching XIP flash (RAM carts only): core 0 pauses
+/// XIP for both flash chips while it erases or programs.
+pub const EXT_FLASH_REQ        : u8 = 0x2B;
+/// Reply, OS -> cart. Payload = ExtFlashStatus.
+pub const EXT_FLASH_DONE       : u8 = 0x2B;
 // zig fmt: on
+
+pub const ExtFlashOp = api.ExtFlashOp;
+pub const ExtFlashStatus = api.ExtFlashStatus;
+
+pub const ExtFlashRequest = extern struct {
+    op: ExtFlashOp,
+    /// Byte offset from the start of the chip; must lie in the cart area.
+    offset: u32,
+    /// Source buffer address in cart RAM (program only).
+    src: u32,
+    len: u32,
+};
+
 
 pub const PresentFlags = packed struct(u32) {
     framebuffer_index: u1,

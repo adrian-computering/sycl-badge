@@ -4,6 +4,7 @@ const std = @import("std");
 const microzig = @import("microzig");
 const hal = microzig.hal;
 const rom_api = hal.rom;
+const ext_flash = @import("ext_flash.zig");
 
 // -----------------------------------------------------------------------------
 // System Control
@@ -23,9 +24,12 @@ pub inline fn connect_internal_flash() void {
     rom_api.connect_internal_flash();
 }
 
-/// Configure the SSI to generate a standard 03h serial read command
+/// Configure the SSI to generate a standard 03h serial read command.
+/// The bootrom does this for both QMI windows, so the external flash
+/// window gets its faster read mode back afterwards.
 pub inline fn flash_enter_cmd_xip() void {
     rom_api.flash_enter_cmd_xip();
+    ext_flash.applyReadMode();
 }
 
 /// Set up SSI for serial-mode operations and issue XIP exit sequence

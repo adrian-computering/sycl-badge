@@ -13,6 +13,7 @@ const timer = @import("../drivers/timer.zig");
 const lcd = @import("../drivers/lcd.zig");
 const adc = @import("../drivers/adc.zig");
 const rom = @import("../drivers/rom.zig");
+const ext_flash = @import("../drivers/ext_flash.zig");
 const loader = @import("../loader/loader.zig");
 const rev = @import("../drivers/rev.zig");
 const rtt = @import("../drivers/rtt.zig");
@@ -177,6 +178,13 @@ pub fn init(config: InitConfig) !void {
     // 5. Initialize cart storage (FAT16 in romfs) before USB starts
     // This avoids USB timeouts while formatting flash on first boot.
     // Ensure internal flash is connected before any ROM access (improves persistence across power cycles)
+    // This also sets up the shared QSPI data pads, which the external chip
+    // needs (with QE clear, SD3 is its HOLD# input).
+    rom.connect_internal_flash();
+    // Then detect the external flash on QMI CS1. Once it is declared in the
+    // bootrom's FLASH_DEVINFO, connect_internal_flash keeps its chip select
+    // routed too, so connect again.
+    ext_flash.init();
     rom.connect_internal_flash();
     storage.init();
 

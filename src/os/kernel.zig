@@ -28,6 +28,7 @@ const mailbox = @import("ipc/mailbox.zig");
 const abi = @import("cart/os_abi.zig");
 const Controls = abi.Controls;
 const i2c = @import("drivers/i2c.zig");
+const ext_flash = @import("drivers/ext_flash.zig");
 
 // Use panic handler from system
 pub const panic = @import("system/panic.zig").panic;
@@ -105,6 +106,7 @@ const MAX_CARTS: usize = 64;
 const MAX_CART_NAME_LEN: usize = 64;
 var cart_names: [MAX_CARTS][MAX_CART_NAME_LEN]u8 = undefined;
 var cart_name_lengths: [MAX_CARTS]usize = undefined;
+var cart_entries: [MAX_CARTS]storage.CartEntry = undefined;
 var collect_index: usize = 0;
 var cart_list_truncated: bool = false;
 
@@ -470,8 +472,39 @@ fn handle_cart_message(msg: u32, sync_time: *bool) void {
         }
     } else if (msg == abi.SYNC_TIME_REQ_CLR) {
         sync_time.* = true;
+    } else if (mailbox.MessageType.getType(msg) == abi.EXT_FLASH_REQ) {
+        const status = handle_ext_flash_request(mailbox.MessageType.getPayload(msg));
+        mailbox.send((@as(u32, abi.EXT_FLASH_DONE) << 24) | @intFromEnum(status));
     }
     // Other messages (e.g. CART_FINISHED) handled by loader state machine.
+}
+
+fn handle_ext_flash_request(payload: u24) abi.ExtFlashStatus {
+    // An XIP cart executes from flash, which is paused during erase/program.
+    if (loader.getEntryPoint().xip) return .unsupported;
+    const req_addr = 0x2000_0000 + @as(u32, payload) * 4;
+    const ram_start = loader.getCartRamStart();
+    const ram_end = loader.getCartRamEnd();
+    if (req_addr < ram_start or req_addr > ram_end - @sizeOf(abi.ExtFlashRequest)) return .bad_buffer;
+    const req: *const volatile abi.ExtFlashRequest = @ptrFromInt(req_addr);
+    const offset = req.offset;
+    const len = req.len;
+    const result = switch (req.op) {
+        .erase => ext_flash.cartErase(offset, len),
+        .program => blk: {
+            const src = req.src;
+            if (src < ram_start or src > ram_end or len > ram_end - src) return .bad_buffer;
+            const data: [*]const u8 = @ptrFromInt(src);
+            break :blk ext_flash.cartProgram(offset, data[0..len]);
+        },
+        _ => return .unsupported,
+    };
+    result catch |err| return switch (err) {
+        error.NotPresent => .unsupported,
+        error.OutOfRange => .out_of_range,
+        error.Misaligned => .misaligned,
+    };
+    return .ok;
 }
 
 pub fn updateNeopixels() void {
@@ -657,6 +690,7 @@ fn collectCartName(name: []const u8, size: u32) void {
     const copy_len = @min(name.len, MAX_CART_NAME_LEN - 1);
     @memcpy(cart_names[collect_index][0..copy_len], name[0..copy_len]);
     cart_name_lengths[collect_index] = copy_len;
+    cart_entries[collect_index] = storage.visitingCart();
     collect_index += 1;
 }
 
@@ -689,7 +723,7 @@ fn runSelectedCart() void {
 
     // Load the cart
     console.println("[BTN] calling loadUF2Cart...");
-    const entry_point = loader.loadUF2Cart(name) catch |err| {
+    const entry_point = loader.loadUF2CartEntry(cart_entries[cursor_index]) catch |err| {
         // Show error on LCD
         lcd.fillRect(0, 50, lcd.width, 70, .black);
         const error_msg = switch (err) {
@@ -754,10 +788,16 @@ fn init_cart_ipc_data() void {
     abi.ipc_data.light_level = .{ .val = adc.light_level };
     abi.ipc_data.battery_level = adc.battery_level;
     terry.client.prepare_for_cart();
+    ext_flash.retryLate();
     abi.ipc_data.os_flags = .{
         .os_clear_supported = false, // TODO OS clear
         .cart_serial_supported = true,
+        .ext_flash = ext_flash.present(),
+        .ext_volume = @intFromEnum(storage.ext_volume_state),
     };
+    abi.ipc_data.ext_flash_size_kb = @intCast(ext_flash.size() / 1024);
+    abi.ipc_data.ext_flash_cart_offset_kb = @intCast(ext_flash.cartAreaOffset() / 1024);
+    abi.ipc_data.ext_flash_diag = ext_flash.bootDiag();
     abi.ipc_data.cart_dma_channels = board.cart_dma_mask;
 }
 

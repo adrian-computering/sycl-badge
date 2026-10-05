@@ -160,6 +160,51 @@ pub fn supports_os_clear() bool {
     return ipc_data.os_flags.os_clear_supported;
 }
 
+pub fn ext_flash() ?[]const u8 {
+    if (!ipc_data.os_flags.ext_flash) return null;
+    const p: [*]const u8 = @ptrFromInt(abi.ext_flash_base);
+    return p[0 .. @as(usize, ipc_data.ext_flash_size_kb) * 1024];
+}
+
+pub fn ext_flash_cart_offset() u32 {
+    return @as(u32, ipc_data.ext_flash_cart_offset_kb) * 1024;
+}
+
+pub fn ext_flash_diag() u32 {
+    return ipc_data.ext_flash_diag;
+}
+
+pub fn ext_flash_volume() u8 {
+    return ipc_data.os_flags.ext_volume;
+}
+
+var ext_flash_req: abi.ExtFlashRequest align(4) = undefined;
+
+/// Ask core 0 to erase or program the external flash and wait for it. This
+/// code and the cart are in RAM, so nothing here fetches from the paused XIP;
+/// this core's interrupts stay masked meanwhile, as their vectors may be in
+/// flash (the cart-saves branch's convention).
+pub noinline fn ext_flash_request(op: abi.ExtFlashOp, offset: u32, src: u32, len: u32) abi.ExtFlashStatus {
+    if (!ipc_data.os_flags.ext_flash) return .unsupported;
+    @as(*volatile abi.ExtFlashRequest, &ext_flash_req).* = .{ .op = op, .offset = offset, .src = src, .len = len };
+    asm volatile ("dmb" ::: .{ .memory = true });
+    const primask: u32 = asm volatile ("mrs %[r], primask"
+        : [r] "=r" (-> u32),
+    );
+    asm volatile ("cpsid i" ::: .{ .memory = true });
+    defer asm volatile ("msr primask, %[p]"
+        :
+        : [p] "r" (primask),
+        : .{ .memory = true });
+    const word: u32 = (@intFromPtr(&ext_flash_req) - 0x2000_0000) / 4;
+    fifo_send((@as(u32, abi.EXT_FLASH_REQ) << 24) | word);
+    while (true) {
+        const msg = fifo_recv();
+        if (msg >> 24 == abi.EXT_FLASH_DONE) return @enumFromInt(@as(u24, @truncate(msg)));
+        handle_os_message(msg);
+    }
+}
+
 // ┌───────────────────────────────────────────────────────────────────────────┐
 // │                                                                           │
 // │ Sound Functions                                                           │

@@ -45,6 +45,7 @@ const usb_descriptors = @import("usb/descriptors.zig");
 const timer = @import("timer.zig");
 const endpoint = @import("usb/endpoint.zig");
 const rom = @import("rom.zig");
+const storage = @import("../loader/storage.zig");
 
 const log = std.log.scoped(.usb_device);
 
@@ -113,7 +114,8 @@ const SetupProcessor = setup.RequestPacketProcessor(.{
 });
 
 fn get_max_lun(_: ?*anyopaque) u4 {
-    return 0;
+    // One LUN per storage volume: the main drive, plus the external flash drive.
+    return @intCast(storage.volumeCount() - 1);
 }
 
 fn bulk_only_mass_storage_reset(_: ?*anyopaque) void {}

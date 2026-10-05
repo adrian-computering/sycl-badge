@@ -332,3 +332,37 @@ class SelectTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExtFlashDriveTests(unittest.TestCase):
+    """Ext-flash firmware (fork/EXT_FLASH.md) adds LUN 1, the SYCLEXTRA drive."""
+
+    def test_sysfs_keeps_lun0_only(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(root))
+        base = os.path.join(root, "bus", "usb", "devices")
+        os.makedirs(os.path.join(base, "1-1.2"))
+        for k, v in {"idVendor": "04d2", "idProduct": "04d2", "serial": SER_A, "product": "SYCL Badge V2"}.items():
+            with open(os.path.join(base, "1-1.2", k), "w") as f:
+                f.write(v + "\n")
+        idir = os.path.join(base, "1-1.2:1.0")
+        os.makedirs(idir)
+        with open(os.path.join(idir, "bInterfaceNumber"), "w") as f:
+            f.write("00\n")
+        # LUN 1 sorts after LUN 0 here, but its disk name sorts first.
+        os.makedirs(os.path.join(idir, "host3", "target3:0:0", "3:0:0:1", "block", "sda"))
+        os.makedirs(os.path.join(idir, "host3", "target3:0:0", "3:0:0:0", "block", "sdb"))
+        (dev,) = discover.scan_sysfs(root)
+        self.assertEqual(dev.disks, ["/dev/sdb"])
+
+    def test_labelled_drive_wins(self):
+        dev = discover.UsbDev(location="1-1.2", vid=0x04D2, pid=0x04D2, serial=SER_A, product="SYCL Badge V2")
+        dev.disks = ["/dev/disk5", "/dev/disk4"]
+        vols = [
+            discover.Volume(path="/Volumes/SYCLEXTRA", device="/dev/disk5", label="SYCLEXTRA"),
+            discover.Volume(path="/Volumes/SYCLBADGE", device="/dev/disk4", label="SYCLBADGE"),
+        ]
+        s = discover.scan(ports=[], usb=[dev], volumes=vols, probe=False, platform="darwin")
+        (b,) = s.badges
+        self.assertEqual(b.drive, "/Volumes/SYCLBADGE")
+        self.assertEqual(s.loose_drives, [])

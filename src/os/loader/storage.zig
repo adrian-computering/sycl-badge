@@ -1,6 +1,8 @@
-//! FAT12-based cart storage in the romfs flash region
+//! FAT12-based cart storage: the romfs flash region (USB LUN 0) and, when the
+//! external QSPI flash is present, a second volume on it (USB LUN 1).
 const std = @import("std");
 const rom = @import("../drivers/rom.zig");
+const ext_flash = @import("../drivers/ext_flash.zig");
 const fat = @import("../drivers/fat.zig");
 const log = std.log.scoped(.storage);
 
@@ -20,11 +22,59 @@ const FLASH_ERASE_CMD: u8 = 0x20;
 const RESERVED_SECTORS: u16 = 1;
 const VOLUME_START_LBA: u32 = 0; // Super-floppy layout (boot sector at LBA0)
 const NUM_FATS: u8 = 2;
-const ROOT_ENTRIES: u16 = 32; // Small root directory for 1.5MB volume
 const SECTORS_PER_CLUSTER: u8 = 1; // 512B clusters for FAT12
 const MEDIA_DESCRIPTOR: u8 = 0xF8;
+/// FAT12 entries 0xFF8..0xFFF mark the end of a cluster chain.
+const FAT12_EOC_MIN: u16 = 0xFF8;
+
+/// One FAT12 volume in memory-mapped flash. Sectors are read straight from
+/// the XIP window and written through the bootrom (flash offset = base - XIP_BASE,
+/// which selects the external chip for 0x11xxxxxx).
+pub const Volume = struct {
+    base: u32,
+    size: u32,
+    root_entries: u16,
+    label: *const [11]u8,
+    serial: u32,
+};
+
+/// Main volume: the romfs region of the internal flash, layout unchanged.
+const ROMFS_ROOT_ENTRIES: u16 = 32; // Small root directory for 1.5MB volume
+/// External volume: room for more files (long names take 2-3 entries each).
+const EXT_ROOT_ENTRIES: u16 = 128;
+/// Fixed size, so a change elsewhere (cart area, a bigger chip) never makes
+/// isSizeCorrect() reformat the drive and lose its files. 3584 sectors =
+/// 3553 clusters, under FAT12's 4085 limit with 512 B clusters.
+const EXT_VOLUME_SIZE: u32 = 1792 * 1024;
+
+var volumes: [2]Volume = undefined;
+var volume_count: u8 = 0;
+
+pub fn volumeCount() u8 {
+    return volume_count;
+}
+
+/// Volume by USB LUN / CartInfo.volume index. Out-of-range indices get the main volume.
+pub fn volume(index: u8) *const Volume {
+    return &volumes[if (index < volume_count) index else 0];
+}
+
+/// Where a listed cart lives; valid inside a listCarts() callback via visitingCart().
+pub const CartEntry = struct {
+    volume: u8,
+    start_cluster: u16,
+    size: u32,
+};
+var visiting: CartEntry = .{ .volume = 0, .start_cluster = 0, .size = 0 };
+
+/// The cart the current listCarts() callback is being called for. Lets
+/// callers remember exactly which file a row is, even if names repeat.
+pub fn visitingCart() CartEntry {
+    return visiting;
+}
 
 pub const CartInfo = struct {
+    volume: u8 = 0,
     start_cluster: u16,
     size: u32,
     short_name: [11:0]u8, // "NAME.EXT" + NUL (fallback)
@@ -65,11 +115,51 @@ var sector_bufs: [2][SECTOR_SIZE]u8 align(8) = undefined;
 
 pub var formatted_this_boot: bool = false;
 
+/// What boot did with the external drive (reported to carts in os_flags).
+pub const ExtVolumeState = enum(u2) { none = 0, kept = 1, formatted = 2, unstable = 3 };
+pub var ext_volume_state: ExtVolumeState = .none;
+
 pub fn init() void {
+    volumes[0] = .{
+        .base = @intFromPtr(&__romfs_region_start__),
+        .size = @intFromPtr(&__romfs_region_end__) - @intFromPtr(&__romfs_region_start__),
+        .root_entries = ROMFS_ROOT_ENTRIES,
+        .label = "SYCLBADGE  ",
+        .serial = 0x20260120,
+    };
+    volume_count = 1;
+    // The end of the chip is the cart-writable area; the volume sits below it.
+    if (ext_flash.present() and ext_flash.cartAreaOffset() >= EXT_VOLUME_SIZE) {
+        volumes[1] = .{
+            .base = ext_flash.base,
+            .size = EXT_VOLUME_SIZE,
+            .root_entries = EXT_ROOT_ENTRIES,
+            .label = "SYCLEXTRA  ",
+            .serial = 0x20261005,
+        };
+        volume_count = 2;
+    }
 
     // Check if filesystem size matches expected (reformat if changed)
-    if (!is_formatted() or !isSizeCorrect()) {
-        formatVolume();
+    for (volumes[0..volume_count], 0..) |*v, index| {
+        if (!is_formatted(v) or !isSizeCorrect(v)) {
+            // The external chip has given garbled reads before (see
+            // ext_flash.QeStatus): never reformat it on reads that don't
+            // repeat. Leave the drive out for this boot instead.
+            if (index == 1 and !ext_flash.readsAgree(0, 2 * SECTOR_SIZE)) {
+                log.err("external volume: reads unstable, not mounting", .{});
+                ext_volume_state = .unstable;
+                volume_count = 1;
+                break;
+            }
+            formatVolume(v);
+            if (index == 1) ext_volume_state = .formatted;
+        } else if (index == 1) {
+            ext_volume_state = .kept;
+        }
+    }
+    if (volume_count > 1) {
+        log.info("external volume: base=0x{X} size={d} KB", .{ volumes[1].base, volumes[1].size / 1024 });
     }
 
     log.info("ROMFS START:        0x{X}", .{@intFromPtr(&__romfs_start__)});
@@ -84,11 +174,15 @@ pub fn init() void {
     log.info("\n{f}\n", .{fat0});
 }
 
-/// Force a complete wipe and reformat of the storage system.
+/// Force a complete wipe and reformat of every volume.
 /// This clears all carts and deleted entries, resetting to a clean state.
 /// Call this when the root directory is full of deleted entries.
 pub fn wipeStorage() void {
-    log.info("wiping storage...", .{});
+    for (volumes[0..volume_count]) |*v| wipeVolume(v);
+}
+
+fn wipeVolume(v: *const Volume) void {
+    log.info("wiping storage at 0x{X}...", .{v.base});
 
     // TODO: might have to clear all this and only do formatVolume at the end, to
     // avoid doing multiple flash erases if the root is very full of deleted entries.
@@ -97,23 +191,22 @@ pub fn wipeStorage() void {
 
     flushPendingWrites();
 
-    const base = romfsBase();
-    const size = romfsSize();
+    const base = v.base;
+    const size = v.size;
     const erase_len = (size + (FLASH_ERASE_BLOCK - 1)) & ~@as(usize, FLASH_ERASE_BLOCK - 1);
     const flash_offset = base - XIP_BASE;
 
-    const cs = interrupt.enter_critical_section();
-    defer cs.leave();
-
-    rom.flash_exit_xip();
-    rom.flash_range_erase(flash_offset, erase_len, FLASH_ERASE_BLOCK, FLASH_ERASE_CMD);
-    rom.flash_flush_cache();
-    rom.flash_enter_cmd_xip();
+    // One erase block per critical section, so a 1.8 MB volume doesn't keep
+    // interrupts off for tens of seconds.
+    var done: usize = 0;
+    while (done < erase_len) : (done += FLASH_ERASE_BLOCK) {
+        eraseBlock(@intCast(flash_offset + done));
+    }
 
     pending_valid = false;
     pending_dirty = false;
 
-    formatVolume();
+    formatVolume(v);
 }
 
 /// Storage statistics for debugging
@@ -134,30 +227,30 @@ pub const StorageStats = struct {
 };
 
 /// Get detailed storage statistics
-pub fn getStats() StorageStats {
+pub fn getStats(v: *const Volume) StorageStats {
     var stats: StorageStats = undefined;
 
     // Basic sizes
-    stats.total_size_bytes = @intCast(romfsSize());
+    stats.total_size_bytes = v.size;
 
     // Calculate filesystem layout
-    const fat_secs = fatSectors();
-    const root_secs = rootDirSectors();
-    const data_start = dataStartLba();
-    const total_secs = volumeTotalSectors();
+    const fat_secs = fatSectors(v);
+    const root_secs = rootDirSectors(v);
+    const data_start = dataStartLba(v);
+    const total_secs = volumeTotalSectors(v);
     const data_secs = total_secs - data_start;
 
     stats.total_clusters = @intCast(data_secs / SECTORS_PER_CLUSTER);
     stats.fat_size_bytes = @intCast(@as(u32, NUM_FATS) * fat_secs * SECTOR_SIZE);
     stats.root_size_bytes = @intCast(@as(u32, root_secs) * SECTOR_SIZE);
     stats.data_size_bytes = @intCast(data_secs * SECTOR_SIZE);
-    stats.root_total_entries = ROOT_ENTRIES;
+    stats.root_total_entries = v.root_entries;
 
     // Count used clusters by walking FAT
     var used: u16 = 0;
     var cluster: u16 = 2;
     while (cluster < stats.total_clusters + 2) : (cluster += 1) {
-        const entry = fatEntry(cluster, &sector_bufs[0], &sector_bufs[1]);
+        const entry = fatEntry(v, cluster, &sector_bufs[0], &sector_bufs[1]);
         if (entry != 0) {
             used += 1;
         }
@@ -167,7 +260,7 @@ pub fn getStats() StorageStats {
     stats.free_space_bytes = @as(u32, stats.free_clusters) * SECTORS_PER_CLUSTER * SECTOR_SIZE;
 
     // Count root directory entries
-    const root_start = VOLUME_START_LBA + RESERVED_SECTORS + (@as(u32, NUM_FATS) * fat_secs);
+    const root_start = rootStartLba(v);
     var lba: u32 = root_start;
     var remaining: u16 = root_secs;
     var used_entries: u16 = 0;
@@ -179,7 +272,7 @@ pub fn getStats() StorageStats {
         lba += 1;
         remaining -= 1;
     }) {
-        readSector(lba, sector_buf[0..]);
+        readSector(v, lba, sector_buf[0..]);
         var i: usize = 0;
         while (i < SECTOR_SIZE) : (i += DIR_ENTRY_SIZE) {
             const entry = sector_buf[i .. i + DIR_ENTRY_SIZE];
@@ -200,35 +293,27 @@ pub fn getStats() StorageStats {
 
     stats.root_used_entries = used_entries;
     stats.root_deleted_entries = deleted_entries;
-    stats.root_free_entries = ROOT_ENTRIES - used_entries;
+    stats.root_free_entries = v.root_entries - used_entries;
     stats.file_count = file_count;
 
     return stats;
 }
 
-fn romfsBase() u32 {
-    return @intFromPtr(&__romfs_region_start__);
+pub fn totalSectors(v: *const Volume) u32 {
+    return @intCast(v.size / SECTOR_SIZE);
 }
 
-fn romfsSize() usize {
-    return @intFromPtr(&__romfs_region_end__) - @intFromPtr(&__romfs_region_start__);
+fn volumeTotalSectors(v: *const Volume) u32 {
+    return totalSectors(v);
 }
 
-pub fn totalSectors() u32 {
-    return @intCast(romfsSize() / SECTOR_SIZE);
+fn rootDirSectors(v: *const Volume) u16 {
+    return @intCast((@as(u32, v.root_entries) * 32 + (SECTOR_SIZE - 1)) / SECTOR_SIZE);
 }
 
-fn volumeTotalSectors() u32 {
-    return totalSectors();
-}
-
-fn rootDirSectors() u16 {
-    return @intCast((@as(u32, ROOT_ENTRIES) * 32 + (SECTOR_SIZE - 1)) / SECTOR_SIZE);
-}
-
-fn fatSectors() u16 {
-    const total = volumeTotalSectors();
-    const root_secs = rootDirSectors();
+fn fatSectors(v: *const Volume) u16 {
+    const total = volumeTotalSectors(v);
+    const root_secs = rootDirSectors(v);
     var fat_secs: u32 = 1;
     while (true) {
         const data_sectors = total - RESERVED_SECTORS - root_secs - (@as(u32, NUM_FATS) * fat_secs);
@@ -241,14 +326,18 @@ fn fatSectors() u16 {
     return @intCast(fat_secs);
 }
 
-fn dataStartLba() u32 {
-    return VOLUME_START_LBA + RESERVED_SECTORS + (@as(u32, NUM_FATS) * fatSectors()) + rootDirSectors();
+fn dataStartLba(v: *const Volume) u32 {
+    return VOLUME_START_LBA + RESERVED_SECTORS + (@as(u32, NUM_FATS) * fatSectors(v)) + rootDirSectors(v);
 }
 
-fn is_formatted() bool {
+fn rootStartLba(v: *const Volume) u32 {
+    return VOLUME_START_LBA + RESERVED_SECTORS + (@as(u32, NUM_FATS) * fatSectors(v));
+}
+
+fn is_formatted(v: *const Volume) bool {
     // Use readSector() instead of direct flash access to ensure we see any pending/buffered data
     var sector_buf = &sector_bufs[0];
-    readSector(0, sector_buf[0..]); // boot sector
+    readSector(v, 0, sector_buf[0..]); // boot sector
 
     const signature = readU16(sector_buf[0..], BS_SIGNATURE);
     const bytes_per_sector = readU16(sector_buf[0..], BS_BYTES_PER_SECTOR);
@@ -265,29 +354,29 @@ fn is_formatted() bool {
     log.info("FAT type: {}", .{boot_sector.get_type()});
 
     // Check all BPB fields match expected values
-    if (signature != 0xAA55 or bytes_per_sector != SECTOR_SIZE or root_entries != ROOT_ENTRIES or !std.mem.eql(u8, fs_type, "FAT12   ")) {
+    if (signature != 0xAA55 or bytes_per_sector != SECTOR_SIZE or root_entries != v.root_entries or !std.mem.eql(u8, fs_type, "FAT12   ")) {
         return false;
     }
-    readSector(1, sector_buf[0..]); // fat0 sector
+    readSector(v, 1, sector_buf[0..]); // fat0 sector
     // FAT12 sector starts with the media descriptor FAT entry (0xFF8) followed by the end of chain (0xFFF)
     const valid = sector_buf[0] == MEDIA_DESCRIPTOR and sector_buf[1] == 0xFF and sector_buf[2] == 0xFF;
     return valid;
 }
 
 /// Check if the stored filesystem size matches current expected size
-fn isSizeCorrect() bool {
+fn isSizeCorrect(v: *const Volume) bool {
     var sector_buf = &sector_bufs[0];
-    readSector(0, sector_buf[0..]); // boot sector
+    readSector(v, 0, sector_buf[0..]); // boot sector
 
     const stored_total = readU16(sector_buf[0..], 19); // Total sectors (16-bit)
-    const expected_total: u16 = @intCast(volumeTotalSectors());
+    const expected_total: u16 = @intCast(volumeTotalSectors(v));
 
     return stored_total == expected_total;
 }
 
-fn formatVolume() void {
-    log.info("formatting volume...", .{});
-    const volume_sectors = volumeTotalSectors();
+fn formatVolume(v: *const Volume) void {
+    log.info("formatting volume at 0x{X}...", .{v.base});
+    const volume_sectors = volumeTotalSectors(v);
     {
         const boot_sector = &sector_bufs[0];
         @memset(boot_sector, 0);
@@ -300,28 +389,28 @@ fn formatVolume() void {
         boot_sector[13] = SECTORS_PER_CLUSTER;
         writeU16(boot_sector[0..], 14, RESERVED_SECTORS);
         boot_sector[16] = NUM_FATS;
-        writeU16(boot_sector[0..], 17, ROOT_ENTRIES);
+        writeU16(boot_sector[0..], 17, v.root_entries);
         writeU16(boot_sector[0..], 19, @intCast(volume_sectors));
         boot_sector[21] = MEDIA_DESCRIPTOR;
-        writeU16(boot_sector[0..], 22, fatSectors());
+        writeU16(boot_sector[0..], 22, fatSectors(v));
         writeU16(boot_sector[0..], 24, 32);
         writeU16(boot_sector[0..], 26, 64);
         writeU32(boot_sector[0..], 28, 0);
         writeU32(boot_sector[0..], 32, 0);
         boot_sector[36] = 0x80;
         boot_sector[38] = 0x29;
-        writeU32(boot_sector[0..], 39, 0x20260120);
-        @memcpy(boot_sector[43..54], "SYCLBADGE  ");
+        writeU32(boot_sector[0..], 39, v.serial);
+        @memcpy(boot_sector[43..54], v.label);
         @memcpy(boot_sector[BS_FS_TYPE .. BS_FS_TYPE + 8], "FAT12   ");
         writeU16(boot_sector[0..], BS_SIGNATURE, 0xAA55);
 
-        writeSector(0, boot_sector[0..]);
+        writeSector(v, 0, boot_sector[0..]);
     }
 
     var sector_buf = &sector_bufs[0];
 
     const fat_start = RESERVED_SECTORS;
-    const fat_secs = fatSectors();
+    const fat_secs = fatSectors(v);
     @memset(sector_buf, 0);
     var fat_index: u8 = 0;
     while (fat_index < NUM_FATS) : (fat_index += 1) {
@@ -339,52 +428,52 @@ fn formatVolume() void {
                 // Subsequent FAT sectors are all zeros
                 @memset(sector_buf[0..3], 0);
             }
-            writeSector(lba, sector_buf);
+            writeSector(v, lba, sector_buf);
         }
     }
 
     const root_lba = fat_start + (@as(u32, NUM_FATS) * fat_secs);
-    const root_secs = rootDirSectors();
+    const root_secs = rootDirSectors(v);
     var j: u16 = 0;
     @memset(sector_buf, 0);
     while (j < root_secs) : (j += 1) {
-        writeSector(root_lba + j, sector_buf);
+        writeSector(v, root_lba + j, sector_buf);
     }
 
     // Write a volume label entry in the first root directory sector.
-    @memcpy(sector_buf[DIR_NAME .. DIR_NAME + 11], "SYCLBADGE  ");
+    @memcpy(sector_buf[DIR_NAME .. DIR_NAME + 11], v.label);
     sector_buf[DIR_ATTR] = 0x08; // Volume label
-    writeSector(root_lba, sector_buf[0..]);
+    writeSector(v, root_lba, sector_buf[0..]);
     flushPendingWrites();
 
     // Mark formatted and record debug message
     formatted_this_boot = true;
-    log.debug("ROMFS formatted: base=0x{x}, size={d} bytes", .{ romfsBase(), romfsSize() });
+    log.debug("volume formatted: base=0x{x}, size={d} bytes", .{ v.base, v.size });
 }
 
-pub fn readSector(lba: u32, dst: []u8) void {
-    if (lba >= totalSectors()) {
+pub fn readSector(v: *const Volume, lba: u32, dst: []u8) void {
+    if (lba >= totalSectors(v)) {
         @memset(dst[0..SECTOR_SIZE], 0);
         return;
     }
-    const addr = romfsBase() + lba * SECTOR_SIZE;
+    const addr = v.base + lba * SECTOR_SIZE;
     const block_addr = addr & ~@as(u32, FLASH_ERASE_BLOCK - 1);
     const block_offset = addr - block_addr;
     if (pending_valid and pending_dirty and block_addr == pending_block_addr) {
         @memcpy(dst[0..SECTOR_SIZE], pending_buf[block_offset .. block_offset + SECTOR_SIZE]);
         return;
     }
-    const base_ptr: [*]const u8 = @ptrFromInt(romfsBase());
+    const base_ptr: [*]const u8 = @ptrFromInt(v.base);
     const offset = @as(usize, lba) * SECTOR_SIZE;
     @memcpy(dst[0..SECTOR_SIZE], base_ptr[offset .. offset + SECTOR_SIZE]);
 }
 
-pub fn writeSector(lba: u32, src: *const [SECTOR_SIZE]u8) linksection(".ram_text") void {
-    if (lba >= totalSectors()) {
+pub fn writeSector(v: *const Volume, lba: u32, src: *const [SECTOR_SIZE]u8) linksection(".ram_text") void {
+    if (lba >= totalSectors(v)) {
         return;
     }
 
-    const addr = romfsBase() + lba * SECTOR_SIZE;
+    const addr = v.base + lba * SECTOR_SIZE;
     const block_addr = addr & ~@as(u32, FLASH_ERASE_BLOCK - 1);
     const block_offset = addr - block_addr;
 
@@ -413,11 +502,21 @@ pub fn getFormattedThisBoot() bool {
 }
 
 pub fn romfsBaseAddr() u32 {
-    return romfsBase();
+    return volumes[0].base;
 }
 
 pub fn romfsSizeBytes() usize {
-    return romfsSize();
+    return volumes[0].size;
+}
+
+noinline fn eraseBlock(flash_offset: u32) linksection(".ram_text") void {
+    const cs = interrupt.enter_critical_section();
+    defer cs.leave();
+
+    rom.flash_exit_xip();
+    rom.flash_range_erase(flash_offset, FLASH_ERASE_BLOCK, FLASH_ERASE_BLOCK, FLASH_ERASE_CMD);
+    rom.flash_flush_cache();
+    rom.flash_enter_cmd_xip();
 }
 
 fn flushPending() linksection(".ram_text") void {
@@ -442,11 +541,16 @@ fn flushPending() linksection(".ram_text") void {
     pending_dirty = false;
 }
 
+/// Visit every cart on every volume (main volume first).
 pub fn listCarts(callback: *const fn (name: []const u8, size: u32) void) void {
+    for (volumes[0..volume_count], 0..) |*v, index| listCartsIn(v, @intCast(index), callback);
+}
+
+fn listCartsIn(v: *const Volume, index: u8, callback: *const fn (name: []const u8, size: u32) void) void {
     var sector_buf = &sector_bufs[0];
     var prev_sector_buf = &sector_bufs[1];
-    const root_start = VOLUME_START_LBA + RESERVED_SECTORS + (@as(u32, NUM_FATS) * fatSectors());
-    const root_secs = rootDirSectors();
+    const root_start = rootStartLba(v);
+    const root_secs = rootDirSectors(v);
     var lba: u32 = root_start;
     var remaining: u16 = root_secs;
     var name_buf: [11:0]u8 = undefined;
@@ -463,7 +567,7 @@ pub fn listCarts(callback: *const fn (name: []const u8, size: u32) void) void {
             prev_sector_buf = sector_buf;
             sector_buf = tmp;
         }
-        readSector(lba, sector_buf[0..]);
+        readSector(v, lba, sector_buf[0..]);
         has_prev_sector = true;
 
         var i: usize = 0;
@@ -484,16 +588,25 @@ pub fn listCarts(callback: *const fn (name: []const u8, size: u32) void) void {
                 formatShortName(entry, &name_buf);
 
             const size = readU32(entry, DIR_FILE_SIZE);
+            visiting = .{ .volume = index, .start_cluster = readU16(entry, DIR_FIRST_CLUSTER), .size = size };
             callback(display_name, size);
         }
     }
 }
 
-/// Count carts in storage and optionally get the first cart's info
+/// Count carts on every volume and optionally get the first cart's info
 /// Returns: number of carts found, fills in first_cart if count == 1
 pub fn countCarts(first_cart: ?*CartInfo) u32 {
-    const root_start = VOLUME_START_LBA + RESERVED_SECTORS + (@as(u32, NUM_FATS) * fatSectors());
-    const root_secs = rootDirSectors();
+    var count: u32 = 0;
+    for (volumes[0..volume_count], 0..) |*v, index| {
+        count += countCartsIn(v, @intCast(index), if (count == 0) first_cart else null);
+    }
+    return count;
+}
+
+fn countCartsIn(v: *const Volume, index: u8, first_cart: ?*CartInfo) u32 {
+    const root_start = rootStartLba(v);
+    const root_secs = rootDirSectors(v);
     var lba: u32 = root_start;
     var remaining: u16 = root_secs;
     var name_buf: [12]u8 = undefined;
@@ -514,7 +627,7 @@ pub fn countCarts(first_cart: ?*CartInfo) u32 {
             sector_buf = prev_sector_buf;
             prev_sector_buf = tmp;
         }
-        readSector(lba, sector_buf[0..]);
+        readSector(v, lba, sector_buf[0..]);
         has_prev_sector = true;
 
         var i: usize = 0;
@@ -531,11 +644,12 @@ pub fn countCarts(first_cart: ?*CartInfo) u32 {
 
             // If caller wants first cart info and we haven't found it yet
             if (first_cart != null and !found_first) {
-                const lfn_len = readLfnEntriesMultiSector(if (lba > root_start) &prev_sector_buf else null, sector_buf[0..], i, lfn_buf[0..]);
+                const lfn_len = readLfnEntriesMultiSector(if (lba > root_start) prev_sector_buf else null, sector_buf[0..], i, lfn_buf[0..]);
 
                 _ = formatShortName(entry, &name_buf);
 
                 first_cart.?.* = CartInfo{
+                    .volume = index,
                     .start_cluster = readU16(entry, DIR_FIRST_CLUSTER),
                     .size = readU32(entry, DIR_FILE_SIZE),
                     .short_name = name_buf,
@@ -552,11 +666,19 @@ pub fn countCarts(first_cart: ?*CartInfo) u32 {
     return count;
 }
 
+/// Find a cart by long or short name, main volume first.
 pub fn findCart(name: []const u8) ?CartInfo {
+    for (volumes[0..volume_count], 0..) |*v, index| {
+        if (findCartIn(v, @intCast(index), name)) |info| return info;
+    }
+    return null;
+}
+
+fn findCartIn(v: *const Volume, index: u8, name: []const u8) ?CartInfo {
     var target: [12]u8 = undefined;
     const target_len = normalizeName(name, &target);
-    const root_start = VOLUME_START_LBA + RESERVED_SECTORS + (@as(u32, NUM_FATS) * fatSectors());
-    const root_secs = rootDirSectors();
+    const root_start = rootStartLba(v);
+    const root_secs = rootDirSectors(v);
     var lba: u32 = root_start;
     var remaining: u16 = root_secs;
     var name_buf: [11:0]u8 = undefined;
@@ -574,7 +696,7 @@ pub fn findCart(name: []const u8) ?CartInfo {
             sector_buf = prev_sector_buf;
             prev_sector_buf = tmp;
         }
-        readSector(lba, sector_buf[0..]);
+        readSector(v, lba, sector_buf[0..]);
         has_prev_sector = true;
 
         var i: usize = 0;
@@ -610,6 +732,7 @@ pub fn findCart(name: []const u8) ?CartInfo {
 
             if (matches) {
                 var result: CartInfo = .{
+                    .volume = index,
                     .start_cluster = readU16(entry, DIR_FIRST_CLUSTER),
                     .size = readU32(entry, DIR_FILE_SIZE),
                     .short_name = name_buf,
@@ -626,11 +749,19 @@ pub fn findCart(name: []const u8) ?CartInfo {
     return null;
 }
 
+/// Delete a cart by name from the first volume that has it.
 pub fn deleteCart(name: []const u8) bool {
+    for (volumes[0..volume_count]) |*v| {
+        if (deleteCartIn(v, name)) return true;
+    }
+    return false;
+}
+
+fn deleteCartIn(v: *const Volume, name: []const u8) bool {
     var target: [12]u8 = undefined;
     const target_len = normalizeName(name, &target);
-    const root_start = VOLUME_START_LBA + RESERVED_SECTORS + (@as(u32, NUM_FATS) * fatSectors());
-    const root_secs = rootDirSectors();
+    const root_start = rootStartLba(v);
+    const root_secs = rootDirSectors(v);
     var lba: u32 = root_start;
     var remaining: u16 = root_secs;
     var name_buf: [11:0]u8 = undefined;
@@ -649,7 +780,7 @@ pub fn deleteCart(name: []const u8) bool {
             sector_buf = prev_sector_buf;
             prev_sector_buf = tmp;
         }
-        readSector(lba, sector_buf[0..]);
+        readSector(v, lba, sector_buf[0..]);
         has_prev_sector = true;
 
         var i: usize = 0;
@@ -700,7 +831,7 @@ pub fn deleteCart(name: []const u8) bool {
                         sector_buf[idx] = 0xE5;
                     }
                 }
-                writeSector(lba, sector_buf[0..]);
+                writeSector(v, lba, sector_buf[0..]);
 
                 // Mark LFN entries in previous sector if they span the boundary
                 if (i == 0 and lba > root_start) {
@@ -716,7 +847,7 @@ pub fn deleteCart(name: []const u8) bool {
                         prev_dirty = true;
                     }
                     if (prev_dirty) {
-                        writeSector(lba - 1, prev_sector_buf[0..]);
+                        writeSector(v, lba - 1, prev_sector_buf[0..]);
                     }
                 }
 
@@ -726,11 +857,11 @@ pub fn deleteCart(name: []const u8) bool {
                 prev_sector_buf.* = undefined;
 
                 // Free the FAT chain and flush all writes to flash
-                clearFatChain(start_cluster, sector_buf, prev_sector_buf);
+                clearFatChain(v, start_cluster, sector_buf, prev_sector_buf);
                 flushPendingWrites();
 
                 // Compact directory to reclaim deleted entry space
-                compactRootDirectory();
+                compactRootDirectory(v);
                 flushPendingWrites();
 
                 return true;
@@ -741,29 +872,30 @@ pub fn deleteCart(name: []const u8) bool {
 }
 
 pub const FileIterator = struct {
+    volume: *const Volume,
     bytes_left: usize,
     cluster: u16,
     sector_index: u8,
 
-    pub fn init(size: u32, start_cluster: u16) @This() {
-        return .{ .bytes_left = size, .cluster = start_cluster, .sector_index = 0 };
+    pub fn init(info: CartInfo) @This() {
+        return .{ .volume = volume(info.volume), .bytes_left = info.size, .cluster = info.start_cluster, .sector_index = 0 };
     }
 
     pub fn next(it: *@This()) ?[]align(4) const u8 {
         if (it.bytes_left == 0) return null;
 
         if (it.sector_index >= SECTORS_PER_CLUSTER) {
-            it.cluster = fatEntry(it.cluster, &sector_bufs[0], &sector_bufs[1]);
+            it.cluster = fatEntry(it.volume, it.cluster, &sector_bufs[0], &sector_bufs[1]);
             it.sector_index = 0;
         }
 
-        if (it.cluster < 2 or it.cluster >= 0xFFF8) {
+        if (it.cluster < 2 or it.cluster >= FAT12_EOC_MIN) {
             it.bytes_left = 0;
             return null;
         }
 
-        const lba = clusterToLba(it.cluster) + it.sector_index;
-        readSector(lba, sector_bufs[0][0..]);
+        const lba = clusterToLba(it.volume, it.cluster) + it.sector_index;
+        readSector(it.volume, lba, sector_bufs[0][0..]);
 
         const valid_len: usize = @min(it.bytes_left, SECTOR_SIZE);
         it.sector_index += 1;
@@ -775,42 +907,43 @@ pub const FileIterator = struct {
 
 pub fn readCart(cart: CartInfo, dst: []u8) u32 {
     if (cart.size == 0) return 0;
+    const v = volume(cart.volume);
     var bytes_left: u32 = cart.size;
     var cluster = cart.start_cluster;
     var dst_offset: usize = 0;
     const sector_buf = &sector_bufs[0];
 
-    while (cluster >= 2 and cluster < 0xFFF8 and bytes_left > 0) {
+    while (cluster >= 2 and cluster < FAT12_EOC_MIN and bytes_left > 0) {
         var sector_index: u8 = 0;
         while (sector_index < SECTORS_PER_CLUSTER and bytes_left > 0) : (sector_index += 1) {
-            const lba = clusterToLba(cluster) + sector_index;
-            readSector(lba, sector_buf[0..]);
+            const lba = clusterToLba(v, cluster) + sector_index;
+            readSector(v, lba, sector_buf[0..]);
             const copy_len = @min(bytes_left, SECTOR_SIZE);
             @memcpy(dst[dst_offset .. dst_offset + copy_len], sector_buf[0..copy_len]);
             bytes_left -= @intCast(copy_len);
             dst_offset += copy_len;
         }
-        cluster = fatEntry(cluster, sector_buf, &sector_bufs[1]);
+        cluster = fatEntry(v, cluster, sector_buf, &sector_bufs[1]);
     }
     return @intCast(dst_offset);
 }
 
-fn clusterToLba(cluster: u16) u32 {
-    return dataStartLba() + (@as(u32, cluster - 2) * SECTORS_PER_CLUSTER);
+fn clusterToLba(v: *const Volume, cluster: u16) u32 {
+    return dataStartLba(v) + (@as(u32, cluster - 2) * SECTORS_PER_CLUSTER);
 }
 
-fn fatEntry(cluster: u16, sector_buf: *[SECTOR_SIZE]u8, next_buf: *[SECTOR_SIZE]u8) u16 {
+fn fatEntry(v: *const Volume, cluster: u16, sector_buf: *[SECTOR_SIZE]u8, next_buf: *[SECTOR_SIZE]u8) u16 {
     const fat_start = VOLUME_START_LBA + RESERVED_SECTORS;
     const offset = @as(u32, cluster) + (@as(u32, cluster) / 2);
     const lba = fat_start + (offset / SECTOR_SIZE);
     const index = @as(usize, offset % SECTOR_SIZE);
-    readSector(lba, sector_buf[0..]);
+    readSector(v, lba, sector_buf[0..]);
     const b0: u8 = sector_buf[index];
     var b1: u8 = 0;
     if (index + 1 < SECTOR_SIZE) {
         b1 = sector_buf[index + 1];
     } else {
-        readSector(lba + 1, next_buf[0..]);
+        readSector(v, lba + 1, next_buf[0..]);
         b1 = next_buf[0];
     }
     if ((cluster & 1) == 0) {
@@ -820,7 +953,7 @@ fn fatEntry(cluster: u16, sector_buf: *[SECTOR_SIZE]u8, next_buf: *[SECTOR_SIZE]
     }
 }
 
-fn setFatEntry(cluster: u16, value: u16, sector_buf: *[SECTOR_SIZE]u8, next_buf: *[SECTOR_SIZE]u8) void {
+fn setFatEntry(v: *const Volume, cluster: u16, value: u16, sector_buf: *[SECTOR_SIZE]u8, next_buf: *[SECTOR_SIZE]u8) void {
     const fat_start = VOLUME_START_LBA + RESERVED_SECTORS;
     const offset = @as(u32, cluster) + (@as(u32, cluster) / 2);
     const base_lba = fat_start + (offset / SECTOR_SIZE);
@@ -828,11 +961,11 @@ fn setFatEntry(cluster: u16, value: u16, sector_buf: *[SECTOR_SIZE]u8, next_buf:
     var fat_index: u8 = 0;
     const val = value & 0x0FFF;
     while (fat_index < NUM_FATS) : (fat_index += 1) {
-        const lba = base_lba + (@as(u32, fat_index) * fatSectors());
-        readSector(lba, sector_buf[0..]);
+        const lba = base_lba + (@as(u32, fat_index) * fatSectors(v));
+        readSector(v, lba, sector_buf[0..]);
         var use_next = false;
         if (index + 1 >= SECTOR_SIZE) {
-            readSector(lba + 1, next_buf[0..]);
+            readSector(v, lba + 1, next_buf[0..]);
             use_next = true;
         }
         if ((cluster & 1) == 0) {
@@ -840,7 +973,7 @@ fn setFatEntry(cluster: u16, value: u16, sector_buf: *[SECTOR_SIZE]u8, next_buf:
             const upper: u8 = @intCast((val >> 8) & 0x0F);
             if (use_next) {
                 next_buf[0] = (next_buf[0] & 0xF0) | upper;
-                writeSector(lba + 1, next_buf[0..]);
+                writeSector(v, lba + 1, next_buf[0..]);
             } else {
                 sector_buf[index + 1] = (sector_buf[index + 1] & 0xF0) | upper;
             }
@@ -850,30 +983,29 @@ fn setFatEntry(cluster: u16, value: u16, sector_buf: *[SECTOR_SIZE]u8, next_buf:
             const upper: u8 = @intCast((val >> 4) & 0xFF);
             if (use_next) {
                 next_buf[0] = upper;
-                writeSector(lba + 1, next_buf[0..]);
+                writeSector(v, lba + 1, next_buf[0..]);
             } else {
                 sector_buf[index + 1] = upper;
             }
         }
-        writeSector(lba, sector_buf[0..]);
+        writeSector(v, lba, sector_buf[0..]);
     }
 }
 
-fn clearFatChain(start: u16, sector_buf_a: *[SECTOR_SIZE]u8, sector_buf_b: *[SECTOR_SIZE]u8) void {
+fn clearFatChain(v: *const Volume, start: u16, sector_buf_a: *[SECTOR_SIZE]u8, sector_buf_b: *[SECTOR_SIZE]u8) void {
     var cluster = start;
-    while (cluster >= 2 and cluster < 0xFFF8) {
-        const next = fatEntry(cluster, sector_buf_a, sector_buf_b);
-        setFatEntry(cluster, 0, sector_buf_a, sector_buf_b);
+    while (cluster >= 2 and cluster < FAT12_EOC_MIN) {
+        const next = fatEntry(v, cluster, sector_buf_a, sector_buf_b);
+        setFatEntry(v, cluster, 0, sector_buf_a, sector_buf_b);
         cluster = next;
     }
 }
 
 /// Compact root directory by removing deleted (0xE5) entries
 /// This shifts all valid entries forward and zeros out the rest
-fn compactRootDirectory() void {
-    const fat_secs = fatSectors();
-    const root_start = VOLUME_START_LBA + RESERVED_SECTORS + (@as(u32, NUM_FATS) * fat_secs);
-    const root_secs = rootDirSectors();
+fn compactRootDirectory(v: *const Volume) void {
+    const root_start = rootStartLba(v);
+    const root_secs = rootDirSectors(v);
 
     var lba: u32 = root_start;
     var read_entry_idx: usize = 0;
@@ -889,9 +1021,9 @@ fn compactRootDirectory() void {
         lba += 1;
         remaining -= 1;
     }) {
-        readSector(lba, read_sector);
+        readSector(v, lba, read_sector);
         var read_offset: usize = 0;
-        while (read_offset < SECTOR_SIZE and read_entry_idx < ROOT_ENTRIES) : (read_offset += DIR_ENTRY_SIZE) {
+        while (read_offset < SECTOR_SIZE and read_entry_idx < v.root_entries) : (read_offset += DIR_ENTRY_SIZE) {
             const entry = read_sector[read_offset..][0..DIR_ENTRY_SIZE];
             read_entry_idx += 1;
 
@@ -907,7 +1039,7 @@ fn compactRootDirectory() void {
 
             // Flush write sector if full
             if (write_offset >= SECTOR_SIZE) {
-                writeSector(root_start + write_sector_index, write_sector);
+                writeSector(v, root_start + write_sector_index, write_sector);
                 write_sector_index += 1;
                 write_offset = 0;
             }
@@ -917,12 +1049,12 @@ fn compactRootDirectory() void {
     // Fill the rest with zeroes
     if (write_sector_index < root_secs) {
         @memset(write_sector[write_offset..], 0);
-        writeSector(root_start + write_sector_index, write_sector);
+        writeSector(v, root_start + write_sector_index, write_sector);
         write_sector_index += 1;
 
         @memset(write_sector[0..write_offset], 0);
         while (write_sector_index < root_secs) {
-            writeSector(root_start + write_sector_index, write_sector);
+            writeSector(v, root_start + write_sector_index, write_sector);
             write_sector_index += 1;
         }
     }

@@ -292,7 +292,12 @@ def scan_sysfs(root: str = "/sys", dev_root: str = "/dev") -> List[UsbDev]:
             ifnum = _hex(_read(os.path.join(idir, "bInterfaceNumber")))
             for tty in glob.glob(os.path.join(idir, "tty", "*")):
                 dev.ttys[os.path.join(dev_root, os.path.basename(tty))] = ifnum if ifnum is not None else -1
-            for blk in glob.glob(os.path.join(idir, "host*", "target*", "*", "block", "*")):
+            for blk in sorted(glob.glob(os.path.join(idir, "host*", "target*", "*", "block", "*"))):
+                # SCSI address H:C:T:L. Ext-flash firmware adds LUN 1, the
+                # SYCLEXTRA drive (fork/EXT_FLASH.md); the cart drive is LUN 0.
+                hctl = os.path.basename(os.path.dirname(os.path.dirname(blk)))
+                if hctl.rsplit(":", 1)[-1] not in ("0", hctl):
+                    continue
                 bname = os.path.basename(blk)
                 path = os.path.join(dev_root, bname)
                 if path not in dev.disks:
@@ -632,6 +637,11 @@ def attach_usb_info(badges: List[Badge], usb: List[UsbDev], volumes: List[Volume
         if not badge.location:
             badge.location = dev.location
         mounted = [by_dev[d] for d in dev.disks if d in by_dev]
+        # With a second drive (SYCLEXTRA, LUN 1) mounted too, the cart drive is
+        # the one labelled SYCLBADGE.
+        labelled = [v for v in mounted if is_badge_volume(v)]
+        if labelled:
+            mounted = labelled
         if mounted:
             badge.drive = mounted[0].path
             used_volumes.add(mounted[0].path)

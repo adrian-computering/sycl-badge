@@ -13,8 +13,8 @@ add a row in the same commit.
 |---|---|---|
 | 0 | `os_clear_supported` | upstream |
 | 1 | `cart_serial_supported` | fork `feature/cart-serial` ([CART_SERIAL.md](CART_SERIAL.md)) |
-| 2 | `ext_flash` | ext-flash firmware (`ext-flash` branch, e2.3 and later) |
-| 3-4 | `ext_volume` (0 none, 1 kept, 2 formatted, 3 unstable) | ext-flash firmware |
+| 2 | `ext_flash` | fork `feature/ext-flash` ([EXT_FLASH.md](EXT_FLASH.md)), e2.3 and later |
+| 3-4 | `ext_volume` (0 none, 1 kept, 2 formatted, 3 unstable) | fork `feature/ext-flash` |
 | 5-15 | free | |
 
 ## Spare words (upstream `_reserved: [3]u32`)
@@ -22,8 +22,8 @@ add a row in the same commit.
 | Address | Contents | Owner |
 |---|---|---|
 | `0x200350F4` | `cart_serial`: `*CartSerialRings` in cart RAM, written by the cart, zeroed by the OS at cart start | fork `feature/cart-serial` |
-| `0x200350F8` | low u16 = ext flash size in KB, high u16 = start of the cart-writable area in KB | ext-flash firmware |
-| `0x200350FC` | `ext_flash_diag`, boot detection result (0 = no ext-flash support) | ext-flash firmware |
+| `0x200350F8` | low u16 = ext flash size in KB, high u16 = start of the cart-writable area in KB | fork `feature/ext-flash` |
+| `0x200350FC` | `ext_flash_diag`, boot detection result (0 = no ext-flash support) | fork `feature/ext-flash` |
 
 No words are left. A new feature talks to the OS through a mailbox message
 instead, the way cart saves do, and gets its row below.
@@ -33,7 +33,7 @@ instead, the way cart saves do, and gets its row below.
 | Type | Name | Owner |
 |---|---|---|
 | `0x25`, `0x26`, `0x29`, `0x2A` | framebuffer, trace, audio, time | upstream |
-| `0x2B` | `EXT_FLASH_REQ` / `EXT_FLASH_DONE` | ext-flash firmware |
+| `0x2B` | `EXT_FLASH_REQ` / `EXT_FLASH_DONE` | fork `feature/ext-flash` |
 | `0x2C` | `CART_SAVE_REQ` | cart saves (`cart-saves` branch) |
 
 ## Rules

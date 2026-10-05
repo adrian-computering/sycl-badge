@@ -15,9 +15,9 @@ FEATURES=(
   feature/usb-console
   feature/cart-serial:feature/usb-console
   feature/net-lobby:feature/cart-serial
+  feature/ext-flash:upstream/main
 )
 IN_PROGRESS=(
-  feature/ext-flash:upstream/main
   feature/cart-saves:upstream/main
 )
 

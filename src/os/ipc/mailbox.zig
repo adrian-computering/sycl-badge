@@ -81,16 +81,10 @@ pub const MessageType = struct {
     // For full 32-bit entry point, use shared memory
     pub const CART_EXECUTE: u8 = 0x20; // Execute cart at entry point
     pub const CartExecute = packed struct(u32) {
-        /// Offset of the vector table or cart descriptor.
-        /// If XIP is true, this is the offset from cart_xip_start
-        /// to the vector table.
-        /// If XIP is false, this is the offset from cart_ram_start
-        /// to the cart descriptor
+        /// Offset from cart_ram_start to the cart descriptor.
         offset: u23,
-        /// If true, the cart is an XIP flash cart and contains a
-        /// vector table with the start address.
-        /// If false, the cart is a RAM cart with a cart descriptor
-        /// which can be used to initialize it.
+        /// Must be false: XIP flash carts are no longer supported (the old
+        /// cart_xip region holds the cart save store). Core 1 refuses true.
         xip: bool,
         /// Message type for sending this value through the mailbox
         msg: u8 = CART_EXECUTE,

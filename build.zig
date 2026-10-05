@@ -40,6 +40,9 @@ pub fn build(b: *Build) void {
                         .root_source_file = b.path("src/os/cart/sim_abi.zig"),
                     }) },
                     .{ .name = "zigimg", .module = b.dependency("zigimg", .{}).module("zigimg") },
+                    .{ .name = "save_store", .module = b.createModule(.{
+                        .root_source_file = b.path("src/os/system/save_store.zig"),
+                    }) },
                 },
             }),
         });
@@ -71,6 +74,8 @@ pub fn build(b: *Build) void {
     install_elf.dir = .{ .custom = "firmware/debug" };
     b.getInstallStep().dependOn(&install_uf2.step);
     b.getInstallStep().dependOn(&install_elf.step);
+    // The same OS image under the name the cart-saves docs use (SAVES.md).
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(kernel.get_emitted_bin(.{ .uf2 = .{ .family_id = .RP2350_ARM_S } }), .{ .custom = "firmware" }, "sycl-os-saves.uf2").step);
 
     // OS cart builds - compiled against the new OS cart API (src/os/cart/api.zig)
     add_cart(b, &dep, .{
@@ -139,6 +144,11 @@ pub fn build(b: *Build) void {
         .name = "sensors",
         .optimize = .ReleaseSmall,
         .root_source_file = b.path("carts/sensors/main.zig"),
+    });
+    add_cart(b, &dep, .{
+        .name = "save-test",
+        .optimize = .ReleaseSmall,
+        .root_source_file = b.path("carts/save-test/main.zig"),
     });
     add_cart(b, &dep, .{
         .name = "empty-cart",

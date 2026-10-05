@@ -133,6 +133,33 @@ pub fn audio_submit_samples(num: usize) void {
 
 // ┌───────────────────────────────────────────────────────────────────────────┐
 // │                                                                           │
+// │ Cart Saves                                                                │
+// │                                                                           │
+// └───────────────────────────────────────────────────────────────────────────┘
+
+/// The simulator always has saves: the same save_store.zig over a fake NOR in
+/// saves.bin next to the simulator binary.
+pub fn save_supported() bool {
+    return true;
+}
+
+pub fn save_transact(op: abi.SaveOp, key: []const u8, buf: ?[*]u8, len: u32, result: *u32) abi.SaveStatus {
+    // There is no "Exit cart" menu in the simulator: registering works, but
+    // exit_requested() never becomes true.
+    if (op == .exit_watch) {
+        result.* = 0;
+        return .ok;
+    }
+    var req: abi.SaveRequest = .{ .op = op, .key_len = @intCast(key.len), .len = len };
+    @memcpy(req.key[0..key.len], key);
+    req.state = .pending;
+    simulator_io_block.api.save_request(&req, buf);
+    result.* = req.result;
+    return req.status;
+}
+
+// ┌───────────────────────────────────────────────────────────────────────────┐
+// │                                                                           │
 // │ Other Functions                                                           │
 // │                                                                           │
 // └───────────────────────────────────────────────────────────────────────────┘

@@ -9,6 +9,8 @@ const Controls = abi.Controls;
 const Rect8 = abi.Rect8;
 
 var active: bool = false;
+/// "Exit cart" is waiting for the cart to save (see kernel.request_cart_exit).
+var saving: bool = false;
 var selected: enum {
     exit_cart,
     brightness,
@@ -55,10 +57,24 @@ pub fn isActive() bool {
     return active;
 }
 
+/// The kernel calls this once the cart finished saving (or timed out) and is
+/// about to be stopped.
+pub fn endSaving() void {
+    if (!saving) return;
+    saving = false;
+    active = false;
+}
+
 pub fn update(pressed: Controls, in_cart: bool, force_refresh: bool) void {
     const num_settings = @typeInfo(@TypeOf(selected)).@"enum".field_names.len;
 
     var redraw = force_refresh;
+
+    if (saving) {
+        // Input is ignored while the cart saves; the kernel ends this.
+        if (redraw) draw(in_cart);
+        return;
+    }
 
     if (pressed.start or pressed.select or pressed.b) {
         active = false;
@@ -98,7 +114,13 @@ pub fn update(pressed: Controls, in_cart: bool, force_refresh: bool) void {
     if (pressed.a) switch (selected) {
         .exit_cart => {
             active = false;
-            kernel.stop_active_cart();
+            if (kernel.request_cart_exit()) {
+                // The cart registered an exit word: keep the box up with
+                // "Saving..." while it saves.
+                active = true;
+                saving = true;
+                draw(in_cart);
+            }
             return;
         },
         .brightness => {
@@ -164,6 +186,7 @@ fn draw(in_cart: bool) void {
     );
     lcd.drawString(12, 28, "Brightness", if (selected == .brightness) .yellow else .white, .black, 1);
     lcd.drawString(12, 38, "Volume", if (selected == .volume) .yellow else .white, .black, 1);
+    if (saving) lcd.drawString(12, 58, "Saving...", .yellow, .black, 1);
 
     var buf: [32]u8 = undefined;
 

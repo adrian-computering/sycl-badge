@@ -25,7 +25,7 @@ MEMORY
    * OS Layout:
    * - OS kernel code/data in flash (512KB - 1/4 of 2MB)
    * - Application storage in romfs (1.25MB for FAT12 filesystem)
-   * - Cart execution region (256KB for XIP cart execution)
+   * - Cart save store (256KB, was the XIP cart region; only save_store.zig writes it)
    * - Kernel RAM: 128KB for OS kernel data/heap
    * - Process RAM: 384KB for user applications (runtime data)
    * - Scratch RAM: 8KB for stacks and fast buffers
@@ -37,9 +37,9 @@ MEMORY
   /* Application storage filesystem - 1.25MB for FAT12 (stores UF2 files) */
   romfs(rx!w)       : ORIGIN = 0x10080000, LENGTH = 1280K
 
-  /* Cart execution region - 256KB for XIP execution of loaded carts */
-  /* Carts are copied here from romfs and executed in-place by Core 1 */
-  cart_xip(rx!w)    : ORIGIN = 0x101C0000, LENGTH = 256K
+  /* Cart save store - 256KB (64 x 4KB blocks), formerly the cart_xip region.
+     Nothing but src/os/system/save_store.zig (via saves.zig) may erase or program it. */
+  saves(rx!w)       : ORIGIN = 0x101C0000, LENGTH = 256K
 
   /* OS kernel RAM - 128KB for kernel data structures, heap, etc */
   kernel_ram(rxw)   : ORIGIN = 0x20000000, LENGTH = 128K
@@ -56,10 +56,9 @@ MEMORY
 __romfs_region_start__ = ORIGIN(romfs);
 __romfs_region_end__ = ORIGIN(romfs) + LENGTH(romfs);
 
-/* Expose Cart XIP region bounds for cart execution */
-__cart_xip_start__ = ORIGIN(cart_xip);
-__cart_xip_end__ = ORIGIN(cart_xip) + LENGTH(cart_xip);
-__cart_xip_size__ = LENGTH(cart_xip);
+/* Expose the cart save store region bounds */
+__saves_region_start__ = ORIGIN(saves);
+__saves_region_end__ = ORIGIN(saves) + LENGTH(saves);
 
 /*
 SECTIONS
@@ -114,16 +113,14 @@ SECTIONS
   } > romfs
 
   /*
-  .cart_xip - Cart execution region for XIP (execute-in-place) execution.
-  Carts are programmed here at runtime and executed directly from flash.
-  This section is managed dynamically - not populated at link time.
+  .saves - the cart save store. Managed at runtime by the save store, never
+  populated at link time (NOLOAD keeps it out of the UF2, so flashing the OS
+  leaves saves alone).
   */
-  .cart_xip (NOLOAD) :
+  .saves (NOLOAD) :
   {
-    __cart_xip_load_start__ = .;
-    . = ORIGIN(cart_xip) + LENGTH(cart_xip);
-    __cart_xip_load_end__ = .;
-  } > cart_xip
+    . = ORIGIN(saves) + LENGTH(saves);
+  } > saves
 
   /*
   .ram_vectors - RAM copy of the vector table if the system relocates

@@ -1,6 +1,6 @@
 //! FAT12-based cart storage in the romfs flash region
 const std = @import("std");
-const rom = @import("../drivers/rom.zig");
+const flash_ops = @import("../drivers/flash_ops.zig");
 const fat = @import("../drivers/fat.zig");
 const log = std.log.scoped(.storage);
 
@@ -102,13 +102,7 @@ pub fn wipeStorage() void {
     const erase_len = (size + (FLASH_ERASE_BLOCK - 1)) & ~@as(usize, FLASH_ERASE_BLOCK - 1);
     const flash_offset = base - XIP_BASE;
 
-    const cs = interrupt.enter_critical_section();
-    defer cs.leave();
-
-    rom.flash_exit_xip();
-    rom.flash_range_erase(flash_offset, erase_len, FLASH_ERASE_BLOCK, FLASH_ERASE_CMD);
-    rom.flash_flush_cache();
-    rom.flash_enter_cmd_xip();
+    flash_ops.erase(flash_offset, @intCast(erase_len));
 
     pending_valid = false;
     pending_dirty = false;
@@ -431,14 +425,8 @@ fn flushPending() linksection(".ram_text") void {
     const flash_offset = pending_block_addr - XIP_BASE;
     log.debug("flushPending: flash_offset=0x{x}, size={d}", .{ flash_offset, FLASH_ERASE_BLOCK });
 
-    const cs = interrupt.enter_critical_section();
-    defer cs.leave();
-
-    rom.flash_exit_xip();
-    rom.flash_range_erase(flash_offset, FLASH_ERASE_BLOCK, FLASH_ERASE_BLOCK, FLASH_ERASE_CMD);
-    rom.flash_range_program(flash_offset, pending_buf[0..FLASH_ERASE_BLOCK]);
-    rom.flash_flush_cache();
-    rom.flash_enter_cmd_xip();
+    // Critical section, XIP off, QMI window 0 restored afterwards.
+    flash_ops.eraseAndProgram(flash_offset, FLASH_ERASE_BLOCK, pending_buf[0..FLASH_ERASE_BLOCK]);
     pending_dirty = false;
 }
 

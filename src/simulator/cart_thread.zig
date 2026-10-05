@@ -2,6 +2,7 @@ const std = @import("std");
 pub const abi = @import("sim_abi");
 const sdl = @import("sdl3");
 const root = @import("root");
+const saves = @import("saves.zig");
 
 extern fn cart_must_call_export_start_code() void;
 extern var simulator_io_block: abi.SimulatorIO;
@@ -151,7 +152,12 @@ const sim_api: abi.SimulatorAPI = .{
     .check_flags = &cart_check_flags,
     .set_flags = &cart_set_flags,
     .wait_for_flags = &cart_wait_for_flags,
+    .save_request = &cart_save_request,
 };
+
+fn cart_save_request(req: *abi.SaveRequest, buf: ?[*]u8) callconv(.c) void {
+    saves.handle(req, buf, cart_micros_since_boot());
+}
 
 fn cart_mark_canceled() void {
     @atomicStore(bool, &cart_running, false, .seq_cst);

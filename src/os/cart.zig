@@ -13,20 +13,8 @@ const abi = @import("cart/os_abi.zig");
 // Use panic handler from system
 pub const panic = @import("system/panic.zig").panic;
 
-/// Linker symbols for cart_xip region
-extern const __cart_xip_start__: u8;
-extern const __cart_xip_end__: u8;
 extern const __process_ram_start__: u8;
 extern const __process_ram_end__: u8;
-
-/// Get cart_xip base address
-fn getCartXipStart() u32 {
-    return @intFromPtr(&__cart_xip_start__);
-}
-
-fn getCartXipEnd() u32 {
-    return @intFromPtr(&__cart_xip_end__);
-}
 
 fn getCartRamStart() u32 {
     return @intFromPtr(&__process_ram_start__);
@@ -160,7 +148,7 @@ fn handleMessage(msg: mailbox.Message) void {
     }
 }
 
-/// Execute a cart loaded in cart_xip region.
+/// Execute a RAM cart loaded into process RAM.
 /// Core 0 is the sole authority over loader state transitions (markRunning /
 /// stop), so Core 1 must NOT touch loader.cart_state.  Doing so from both
 /// cores creates a data race that can make the kernel see the state flicker,
@@ -169,51 +157,13 @@ fn handleMessage(msg: mailbox.Message) void {
 fn executeCart(exec: mailbox.MessageType.CartExecute) void {
     mailbox.send(mailbox.MessageType.CART_RUNNING);
 
-    const cart_xip_start = getCartXipStart();
-    const cart_xip_end = getCartXipEnd();
     const cart_ram_start = getCartRamStart();
-    const cart_shared_ram_end = cart_ram_start + @sizeOf(abi.CartIPCData);
     const cart_ram_end = getCartRamEnd();
     if (exec.xip) {
-        const vector_table_addr = cart_xip_start + exec.offset;
-
-        const vector_table: *const [2]u32 = @ptrFromInt(vector_table_addr);
-        const initial_sp = vector_table[0];
-        const entry_point = vector_table[1];
-
-        // Validate SP/PC from cart vector table before taking over Core 1.
-        // Bad values here often show up later as UsageFault INVSTATE on first
-        // exception entry/return.
-        if ((initial_sp & 0x7) != 0) {
-            mailbox.send(mailbox.MessageType.CART_CRASHED);
-            return;
-        }
-        if (initial_sp < cart_shared_ram_end or initial_sp > cart_ram_end) {
-            mailbox.send(mailbox.MessageType.CART_CRASHED);
-            return;
-        }
-        if ((entry_point & 0x1) == 0) {
-            mailbox.send(mailbox.MessageType.CART_CRASHED);
-            return;
-        }
-        const entry_even = entry_point & 0xFFFF_FFFE;
-        if (entry_even < cart_xip_start or entry_even >= cart_xip_end) {
-            mailbox.send(mailbox.MessageType.CART_CRASHED);
-            return;
-        }
-
-        clearCore1InterruptAndFaultState();
-
-        // Point Core 1's VTOR at the cart's vector table so that any exceptions
-        // (HardFault, etc.) use the cart's handlers instead of the OS kernel's.
-        const VTOR: *volatile u32 = @ptrFromInt(0xE000ED08);
-        VTOR.* = vector_table_addr;
-
-        asm volatile ("dsb");
-        asm volatile ("isb");
-
-        // One-way jump — the cart takes over Core 1.  jumpToCart never returns.
-        jumpToCart(initial_sp, entry_point);
+        // XIP carts are not supported (the old cart_xip flash region holds the
+        // cart save store); the loader never produces this.
+        mailbox.send(mailbox.MessageType.CART_CRASHED);
+        return;
     } else {
         const header: [*]u32 = @ptrFromInt(cart_ram_start + exec.offset);
         if (header[0] != abi.CART_MAGIC) {

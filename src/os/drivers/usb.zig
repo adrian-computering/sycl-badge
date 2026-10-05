@@ -303,14 +303,15 @@ fn stall(ep: types.Endpoint) void {
     const buf_ctrl = buffer_control(ep);
 
     if (ep.num == .ep0) {
-        buf_ctrl.write(.{
-            .STALL = 1,
-            .LAST_0 = 1,
+        // The controller only honors STALL on EP0 while EP_STALL_ARM is set,
+        // and clears EP_STALL_ARM when the next SETUP packet arrives, as the
+        // USB spec requires. The buffer is left unavailable, so after that
+        // SETUP packet the endpoint NAKs until it is armed again.
+        rp2xxx.hw.set_alias(&USB.EP_STALL_ARM).write(switch (ep.dir) {
+            .in => .{ .EP0_IN = 1 },
+            .out => .{ .EP0_OUT = 1 },
         });
-
-        buffer_control_delay();
-
-        buf_ctrl.modify(.{ .AVAILABLE_0 = 1 });
+        buf_ctrl.write(.{ .STALL = 1 });
         return;
     }
 
@@ -478,6 +479,13 @@ fn get_buffer() []const u8 {
 fn queue_receive() void {
     const buf_ctrl = buffer_control(.{ .dir = .out, .num = .ep0 });
 
+    // Already armed. Rewriting the buffer control register now could race
+    // with a packet arriving.
+    const current = buf_ctrl.read();
+    if (current.AVAILABLE_0 == 1 and current.STALL == 0) return;
+    // A packet arrived that `poll` has not handled yet, arming would lose it
+    if (USB.BUFF_STATUS.read().EP0_OUT == 1) return;
+
     log.debug("queue_receive", .{});
 
     // Accept a full packet: either the zero length status stage of a control
@@ -583,8 +591,10 @@ pub fn poll() void {
         }
 
         if (buff_status.EP0_OUT == 1) {
-            setup_processor.ep0_out_ready();
+            // Cleared first: the handler may arm the endpoint again, and
+            // queue_receive treats a set bit as a packet still to handle
             clear.write(.{ .EP0_OUT = 1 });
+            setup_processor.ep0_out_ready();
         }
 
         if (buff_status.EP1_IN == 1) {

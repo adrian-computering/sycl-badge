@@ -18,6 +18,14 @@
 //! `beginWrite`/`beginDelete` validate and plan, then `step()` does at most one
 //! `erase4k` plus that block's page programs, or one block read-back verify, per call.
 //!
+//! Reserve: every commit leaves at least `max_blob_blocks` (16) data blocks free, so an
+//! overwrite of any key (up to 64 KB) always finds the blocks its new copy needs while
+//! the old copy still exists. Overwrites that don't grow a key never fail with no_space.
+//! A new key, or a growing overwrite, that would leave fewer than 16 blocks free after
+//! the commit (the old copy's blocks counted as freed) gets no_space. Usable capacity for
+//! new data is therefore 62 - 16 = 46 blocks = 184 KB, and since each key takes at least
+//! one block, at most 46 keys (`max_entries`). The directory format keeps 63 entry slots.
+//!
 //! Unchanged writes: when the bytes equal the stored blob, `beginWrite` returns `.ok`
 //! and the first `step()` returns `.done = .ok` without touching flash or spending a
 //! rate-limit token.
@@ -36,7 +44,7 @@ pub const block_size: u32 = 4096;
 pub const block_count: u32 = 64; // region = 256 KB; blocks 0,1 = directory A/B, 2..63 data
 pub const page_size: u32 = 256;
 pub const max_blob: u32 = 64 * 1024;
-pub const max_entries: u32 = 63;
+pub const max_entries: u32 = 46; // = usable_blocks: each key takes at least one block
 pub const max_key: u32 = 32;
 
 pub const abi_version: u32 = 1;
@@ -45,6 +53,12 @@ pub const first_data_block: u32 = 2;
 pub const data_block_count: u32 = block_count - first_data_block; // 62
 pub const data_capacity: u32 = data_block_count * block_size; // 253952
 pub const max_blob_blocks: u32 = max_blob / block_size; // 16
+/// Data blocks every commit leaves free (see "Reserve" above).
+pub const reserve_blocks: u32 = max_blob_blocks;
+pub const usable_blocks: u32 = data_block_count - reserve_blocks; // 46
+pub const usable_capacity: u32 = usable_blocks * block_size; // 184 KB
+/// Entry slots in the on-flash directory block (format constant, > max_entries).
+pub const dir_slots: u32 = 63;
 
 /// Token bucket for commits (writes that change flash, and deletes).
 pub const rate_burst: u32 = 8;
@@ -59,9 +73,10 @@ pub const Flash = struct { // offsets are relative to the region start
     program: *const fn (ctx: *anyopaque, off: u32, src: []const u8) void, // off and len multiples of 256
 };
 
-/// `region_bytes` is the data capacity (62 x 4 KB), so `free_bytes == region_bytes` on an
-/// empty store. `free_bytes` is free data blocks x 4 KB (0 when the directory is full);
-/// one blob still can't exceed `max_blob`.
+/// `region_bytes` is the data capacity (62 x 4 KB). `free_bytes` is what a NEW key could
+/// take: max(0, free_blocks - 16) x 4 KB, so 46 x 4 KB = 184 KB on an empty store (still
+/// capped per blob by `max_blob`; 0 when `entries == max_entries`). Overwrites that don't
+/// grow a key work even when `free_bytes == 0`.
 pub const Stat = extern struct { version: u32, region_bytes: u32, free_bytes: u32, max_blob: u32, entries: u32, max_entries: u32, writes_left_now: u32, _r: u32 = 0 };
 pub const ListEntry = extern struct { key_len: u32, key: [32]u8, size: u32 };
 pub const ReadResult = struct { status: Status, size: u32 };
@@ -101,7 +116,7 @@ const DirEntry = extern struct {
 
 const Dir = extern struct {
     hdr: DirHeader,
-    entries: [max_entries]DirEntry,
+    entries: [dir_slots]DirEntry,
 };
 
 const Phase = enum(u8) { idle, noop, erase_other, data_program, data_verify, dir_program, dir_verify };
@@ -191,10 +206,11 @@ pub const Store = struct {
         self.refill(now_us);
         const d = &self.dirs[self.live];
         const free = freeBlockCount(d);
+        const spare = if (free > reserve_blocks) free - reserve_blocks else 0;
         return .{
             .version = abi_version,
             .region_bytes = data_capacity,
-            .free_bytes = if (d.hdr.count >= max_entries) 0 else free * block_size,
+            .free_bytes = if (d.hdr.count >= max_entries) 0 else spare * block_size,
             .max_blob = max_blob,
             .entries = d.hdr.count,
             .max_entries = max_entries,
@@ -237,10 +253,17 @@ pub const Store = struct {
                 return .ok;
             }
         }
+        if (found == null and cur.hdr.count >= max_entries) return .no_space;
         const slot = found orelse freeSlot(cur) orelse return .no_space;
         const nblocks = (size + block_size - 1) / block_size;
         const used = usedBlocks(cur);
-        if (data_block_count - @popCount(used) < nblocks) return .no_space;
+        const free = data_block_count - @popCount(used);
+        const old_blocks: u32 = if (found) |i| cur.entries[i].nblocks else 0;
+        // The new copy is written while the old one exists.
+        if (free < nblocks) return .no_space;
+        // Reserve: free after the commit must stay >= 16, except that a non-growing
+        // overwrite is always allowed (it never lowers the free count).
+        if (nblocks > old_blocks and free + old_blocks - nblocks < reserve_blocks) return .no_space;
         if (!self.takeToken(now_us)) return .rate_limited;
 
         const other = &self.dirs[1 - @as(u2, self.live)];

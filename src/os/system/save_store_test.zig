@@ -177,6 +177,27 @@ fn del(st: *ss.Store, sim: *Sim, key: []const u8, now: u64) !ss.Status {
 
 fn putOk(st: *ss.Store, sim: *Sim, key: []const u8, data: []const u8, now: u64) !void {
     try expectEqual(ss.Status.ok, try put(st, sim, key, data, now));
+    try expectReserve(st);
+}
+
+/// Free data blocks of the live directory, counted from list() (stat clamps them).
+fn freeBlocks(st: *ss.Store) u32 {
+    var out: [ss.dir_slots]ss.ListEntry = undefined;
+    const n = st.list(&out);
+    var used: u32 = 0;
+    for (out[0..n]) |e| used += (e.size + ss.block_size - 1) / ss.block_size;
+    return ss.data_block_count - used;
+}
+
+/// The reserve invariant: every committed directory leaves >= 16 data blocks free.
+fn expectReserve(st: *ss.Store) !void {
+    const free = freeBlocks(st);
+    if (free < ss.reserve_blocks) {
+        std.debug.print("reserve broken: {d} free blocks\n", .{free});
+        return error.TestUnexpectedResult;
+    }
+    // stat at the bucket's own clock, so the check doesn't move the rate limiter
+    try expectEqual((free - ss.reserve_blocks) * ss.block_size, st.stat(st.refill_us).free_bytes);
 }
 
 /// true when `key` reads back exactly as `want` (null = absent).
@@ -270,7 +291,7 @@ test "overwrite grows and shrinks" {
     const s = st.stat(0);
     try expectEqual(@as(u32, 2), s.entries);
     // small = 1 block, mid = 2 blocks: old copies are freed after each overwrite.
-    try expectEqual(ss.data_capacity - 3 * ss.block_size, s.free_bytes);
+    try expectEqual(ss.usable_capacity - 3 * ss.block_size, s.free_bytes);
 
     var st2: ss.Store = undefined;
     mount(&st2, sim);
@@ -295,7 +316,7 @@ test "delete" {
     try expectBlob(&st, "b", null);
     try expectBlob(&st, "a", &a);
     try expectEqual(ss.Status.not_found, try del(&st, sim, "b", 0));
-    try expectEqual(ss.data_capacity - ss.block_size, st.stat(0).free_bytes);
+    try expectEqual(ss.usable_capacity - ss.block_size, st.stat(0).free_bytes);
 
     var st2: ss.Store = undefined;
     mount(&st2, sim);
@@ -351,10 +372,10 @@ test "list and stat" {
     try expectEqual(ss.Stat{
         .version = 1,
         .region_bytes = ss.data_capacity,
-        .free_bytes = ss.data_capacity,
+        .free_bytes = ss.usable_capacity,
         .max_blob = ss.max_blob,
         .entries = 0,
-        .max_entries = 63,
+        .max_entries = 46,
         .writes_left_now = 8,
     }, s);
     var d: [5000]u8 = @splat(1);
@@ -364,7 +385,7 @@ test "list and stat" {
     _ = try del(&st, sim, "two", 0);
     s = st.stat(0);
     try expectEqual(@as(u32, 2), s.entries);
-    try expectEqual(ss.data_capacity - 2 * ss.block_size, s.free_bytes);
+    try expectEqual(ss.usable_capacity - 2 * ss.block_size, s.free_bytes);
     try expectEqual(@as(u32, 4), s.writes_left_now);
 
     var out: [4]ss.ListEntry = undefined;
@@ -379,9 +400,7 @@ test "list and stat" {
     try expectEqual(@as(u32, 0), st.list(out[0..0]));
 }
 
-test "many keys: every data block holds a key" {
-    // Each key takes at least one 4 KB block and there are 62 data blocks, so the block
-    // limit (62 keys) is reached before the 63-entry directory is full.
+test "many keys: 46 keys, then overwrites still work" {
     const sim = try Sim.create(0xFF);
     defer sim.destroy();
     var st: ss.Store = undefined;
@@ -389,80 +408,123 @@ test "many keys: every data block holds a key" {
     var now: u64 = 0;
     var key_buf: [16]u8 = undefined;
     var d: [64]u8 = undefined;
-    for (0..ss.data_block_count) |i| {
+    for (0..ss.max_entries) |i| {
         const key = try std.fmt.bufPrint(&key_buf, "key{d}", .{i});
         try putOk(&st, sim, key, pattern(&d, i), now);
         now += ss.rate_interval_us;
     }
-    try expectEqual(@as(u32, 62), st.stat(now).entries);
+    try expectEqual(@as(u32, 46), st.stat(now).entries);
+    try expectEqual(@as(u32, 16), freeBlocks(&st));
     try expectEqual(@as(u32, 0), st.stat(now).free_bytes);
-    try expectEqual(ss.Status.no_space, st.beginWrite("one-more", &d, now));
-    // copy-on-write: an overwrite needs a free block too
-    try expectEqual(ss.Status.no_space, st.beginWrite("key5", "new five", now));
-    // ... but an unchanged write is still fine
-    try expectEqual(ss.Status.ok, try put(&st, sim, "key5", pattern(&d, 5), now));
+    try expectEqual(ss.Status.no_space, st.beginWrite("one-more", "x", now));
+    // every key can be overwritten with same-size and with smaller data
+    for (0..ss.max_entries) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "key{d}", .{i});
+        try putOk(&st, sim, key, pattern(&d, 500 + i), now);
+        now += ss.rate_interval_us;
+        try putOk(&st, sim, key, pattern(d[0..32], 600 + i), now);
+        now += ss.rate_interval_us;
+    }
+    // growing to 2 blocks would leave 15 free
+    var big: [5000]u8 = undefined;
+    try expectEqual(ss.Status.no_space, st.beginWrite("key5", pattern(&big, 5), now));
     try expectEqual(ss.Status.ok, try del(&st, sim, "key7", now));
     now += ss.rate_interval_us;
-    try putOk(&st, sim, "key5", "new five", now);
+    try putOk(&st, sim, "key5", &big, now); // 17 + 1 - 2 = 16 free
     now += ss.rate_interval_us;
-    try putOk(&st, sim, "one-more", "hi", now);
+    try expectEqual(ss.Status.no_space, st.beginWrite("one-more", "x", now));
 
     var st2: ss.Store = undefined;
     mount(&st2, sim);
-    var out: [63]ss.ListEntry = undefined;
-    try expectEqual(@as(u32, 62), st2.list(&out));
-    for (0..ss.data_block_count) |i| {
+    var out: [ss.dir_slots]ss.ListEntry = undefined;
+    try expectEqual(@as(u32, 45), st2.list(&out));
+    for (0..ss.max_entries) |i| {
         const key = try std.fmt.bufPrint(&key_buf, "key{d}", .{i});
         if (i == 5) {
-            try expectBlob(&st2, key, "new five");
+            try expectBlob(&st2, key, &big);
         } else if (i == 7) {
             try expectBlob(&st2, key, null);
         } else {
-            try expectBlob(&st2, key, pattern(&d, i));
+            try expectBlob(&st2, key, pattern(d[0..32], 600 + i));
         }
     }
-    try expectBlob(&st2, "one-more", "hi");
+    try expectReserve(&st2);
     try expect(!sim.violation);
 }
 
-test "full region: no_space" {
+/// 2 x 64 KB + 14 x 4 KB = 46 blocks: new keys get no_space, 16 blocks stay free.
+fn fillToReserve(st: *ss.Store, sim: *Sim, max: []const u8, now: *u64) !void {
+    var key_buf: [16]u8 = undefined;
+    for (0..2) |i| {
+        try putOk(st, sim, try std.fmt.bufPrint(&key_buf, "big{d}", .{i}), max, now.*);
+        now.* += ss.rate_interval_us;
+    }
+    for (0..14) |i| {
+        try putOk(st, sim, try std.fmt.bufPrint(&key_buf, "small{d}", .{i}), max[i .. i + 4096], now.*);
+        now.* += ss.rate_interval_us;
+    }
+}
+
+test "full region: no_space for new data, overwrites always work" {
     const sim = try Sim.create(0xFF);
     defer sim.destroy();
     var st: ss.Store = undefined;
     mount(&st, sim);
     const max = try blob(ss.max_blob, 30);
     defer testing.allocator.free(max);
+    const alt = try blob(ss.max_blob, 31);
+    defer testing.allocator.free(alt);
     var now: u64 = 0;
     var key_buf: [16]u8 = undefined;
-    // 3 x 16 blocks + 14 x 1 block = 62 data blocks
-    for (0..3) |i| {
-        try putOk(&st, sim, try std.fmt.bufPrint(&key_buf, "big{d}", .{i}), max, now);
-        now += ss.rate_interval_us;
-    }
-    for (0..14) |i| {
-        try putOk(&st, sim, try std.fmt.bufPrint(&key_buf, "small{d}", .{i}), max[i .. i + 4096], now);
-        now += ss.rate_interval_us;
-    }
+    try fillToReserve(&st, sim, max, &now);
+    try expectEqual(@as(u32, 16), freeBlocks(&st));
     try expectEqual(@as(u32, 0), st.stat(now).free_bytes);
     const before = sim.mutatingOps();
     try expectEqual(ss.Status.no_space, st.beginWrite("new", "x", now));
-    // copy-on-write needs a free block while the old copy exists
-    try expectEqual(ss.Status.no_space, st.beginWrite("small3", "changed", now));
+    // growing a 1-block key to 2 blocks would leave 15 free
+    try expectEqual(ss.Status.no_space, st.beginWrite("small3", alt[0..4097], now));
     try expectEqual(before, sim.mutatingOps());
+
+    // every key: same size, then smaller
+    for (0..2) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "big{d}", .{i});
+        try putOk(&st, sim, key, alt, now);
+        now += ss.rate_interval_us;
+        try putOk(&st, sim, key, max[0 .. ss.max_blob - 1], now); // still 16 blocks
+        now += ss.rate_interval_us;
+    }
+    for (0..14) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "small{d}", .{i});
+        try putOk(&st, sim, key, alt[i .. i + 4096], now);
+        now += ss.rate_interval_us;
+        try putOk(&st, sim, key, alt[i .. i + 100], now);
+        now += ss.rate_interval_us;
+    }
+    try expectEqual(@as(u32, 16), freeBlocks(&st));
+    // shrinking big0 to 15 blocks frees one, which lets small3 grow to 2 blocks
+    try putOk(&st, sim, "big0", alt[0 .. 15 * 4096], now);
+    now += ss.rate_interval_us;
+    try expectEqual(ss.block_size, st.stat(now).free_bytes);
+    try putOk(&st, sim, "small3", alt[0..8192], now);
+    now += ss.rate_interval_us;
+    try expectEqual(ss.Status.no_space, st.beginWrite("new", "x", now));
     try expectEqual(ss.Status.ok, try del(&st, sim, "small0", now));
     now += ss.rate_interval_us;
-    try putOk(&st, sim, "small3", "changed", now);
-    now += ss.rate_interval_us;
-    // small3's old block is free again
     try putOk(&st, sim, "new", "x", now);
+    now += ss.rate_interval_us;
+    // big1 can grow back to the full 64 KB: 16 + 16 - 16
+    try putOk(&st, sim, "big1", max, now);
 
     var st2: ss.Store = undefined;
     mount(&st2, sim);
-    for (0..3) |i| try expectBlob(&st2, try std.fmt.bufPrint(&key_buf, "big{d}", .{i}), max);
-    try expectBlob(&st2, "small3", "changed");
+    try expectBlob(&st2, "big0", alt[0 .. 15 * 4096]);
+    try expectBlob(&st2, "big1", max);
     try expectBlob(&st2, "small0", null);
-    try expectBlob(&st2, "small13", max[13 .. 13 + 4096]);
+    try expectBlob(&st2, "small3", alt[0..8192]);
+    try expectBlob(&st2, "small13", alt[13 .. 13 + 100]);
     try expectBlob(&st2, "new", "x");
+    try expectReserve(&st2);
+    try expectEqual(@as(u32, 16), freeBlocks(&st2));
     try expect(!sim.violation);
 }
 
@@ -592,7 +654,7 @@ test "garbage region mounts empty and formats lazily" {
         mount(&st, sim);
         try expectEqual(@as(u32, 0), sim.mutatingOps()); // mount never writes
         try expectEqual(@as(u32, 0), st.stat(0).entries);
-        try expectEqual(ss.data_capacity, st.stat(0).free_bytes);
+        try expectEqual(ss.usable_capacity, st.stat(0).free_bytes);
         var out: [4]ss.ListEntry = undefined;
         try expectEqual(@as(u32, 0), st.list(&out));
         try expectBlob(&st, "k", null);
@@ -743,14 +805,30 @@ fn checkAfterCut(sim: *Sim, key: []const u8, old: ?[]const u8, new: ?[]const u8,
         return error.TestUnexpectedResult;
     }
     try expectAll(&st, others);
+    try expectReserve(&st);
     const now_val = if (is_new) new else old;
 
-    try putOk(&st, sim, "follow-up", "after the cut", 0);
+    // Follow-up commit: a new key, or, when the store is at its reserve, an overwrite of
+    // `key` with same-size data (which must always work).
+    var flipped: [ss.max_blob]u8 = undefined;
+    var key_val = now_val;
+    const r = try put(&st, sim, "follow-up", "after the cut", 0);
+    if (r == .no_space) {
+        try expectEqual(@as(u32, 0), st.stat(0).free_bytes);
+        const v = now_val orelse return error.TestUnexpectedResult;
+        for (flipped[0..v.len], v) |*d, b| d.* = b ^ 0x5A;
+        try putOk(&st, sim, key, flipped[0..v.len], 0);
+        key_val = flipped[0..v.len];
+    } else {
+        try expectEqual(ss.Status.ok, r);
+        try expectReserve(&st);
+    }
     var st2: ss.Store = undefined;
     mount(&st2, sim);
-    try expectBlob(&st2, key, now_val);
-    try expectBlob(&st2, "follow-up", "after the cut");
+    try expectBlob(&st2, key, key_val);
+    try expectBlob(&st2, "follow-up", if (r == .ok) "after the cut" else null);
     try expectAll(&st2, others);
+    try expectReserve(&st2);
     try expect(!sim.violation);
 }
 
@@ -864,6 +942,76 @@ test "power-cut sweep: first write on a garbage region" {
     const d = try blob(6000, 111);
     defer testing.allocator.free(d);
     _ = try sweep(sim, "k", null, .{ .write = d }, &.{});
+}
+
+test "power-cut sweep: 64 KB overwrite with the store at its reserve" {
+    const sim = try Sim.create(0xFF);
+    defer sim.destroy();
+    var st: ss.Store = undefined;
+    mount(&st, sim);
+    const max = try blob(ss.max_blob, 120);
+    defer testing.allocator.free(max);
+    const new = try blob(ss.max_blob, 121);
+    defer testing.allocator.free(new);
+    var now: u64 = 0;
+    try fillToReserve(&st, sim, max, &now);
+    try expectEqual(ss.Status.no_space, st.beginWrite("new", "x", now));
+    var names: [14][8]u8 = undefined;
+    var others: [15]KV = undefined;
+    others[0] = .{ .key = "big1", .data = max };
+    for (0..14) |i| {
+        const key = try std.fmt.bufPrint(&names[i], "small{d}", .{i});
+        others[i + 1] = .{ .key = key, .data = max[i .. i + 4096] };
+    }
+    sim.resetCounters();
+    const t = try sweep(sim, "big0", max, .{ .write = new }, &others);
+    try expectEqual(@as(u32, 17 * 17), t);
+    // and a shrinking small key
+    _ = try sweep(sim, "small4", max[4 .. 4 + 4096], .{ .write = "short" }, others[0..4]);
+}
+
+test "at the reserve: abort, verify failure and the dirty-directory erase keep overwrites working" {
+    const base = try Sim.create(0xFF);
+    defer base.destroy();
+    var st0: ss.Store = undefined;
+    mount(&st0, base);
+    const max = try blob(ss.max_blob, 130);
+    defer testing.allocator.free(max);
+    const new = try blob(ss.max_blob, 131);
+    defer testing.allocator.free(new);
+    var now: u64 = 0;
+    try fillToReserve(&st0, base, max, &now);
+
+    // abort after k steps (k = 0..33 of a 34-step 64 KB overwrite), or a verify failure
+    // in a data block / in the directory; then 64 KB overwrites of both big keys
+    var case: u32 = 0;
+    while (case < 34 + 2) : (case += 1) {
+        const sim = try base.clone();
+        defer sim.destroy();
+        var st: ss.Store = undefined;
+        mount(&st, sim);
+        if (case < 34) {
+            try expectEqual(ss.Status.ok, st.beginWrite("big0", new, 0));
+            for (0..case) |_| try expect(st.step() == .more);
+            st.abort();
+        } else {
+            sim.flip_at = if (case == 34) 5 * 17 + 3 else 16 * 17 + 1;
+            try expectEqual(ss.Status.io_error, try put(&st, sim, "big0", new, 0));
+        }
+        try expectReserve(&st);
+        try expectBlob(&st, "big0", max);
+        try putOk(&st, sim, "big1", new, 0);
+        try putOk(&st, sim, "big0", new, 0);
+        try putOk(&st, sim, "small2", "s", 0);
+        try expectEqual(ss.Status.no_space, st.beginWrite("new", "x", 0));
+        var re: ss.Store = undefined;
+        mount(&re, sim);
+        try expectBlob(&re, "big0", new);
+        try expectBlob(&re, "big1", new);
+        try expectBlob(&re, "small2", "s");
+        try expectReserve(&re);
+        try expect(!sim.violation);
+    }
 }
 
 test "power cut mid data program and mid directory write" {

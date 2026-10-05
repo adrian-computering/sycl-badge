@@ -199,6 +199,10 @@ Error codes: 1 unsupported version, 2 no room (server full), 3 not joined
 
 - A cart sends HELLO when it opens the port and again whenever `connected()`
   goes from false to true (the lobby restarted, or the cable was replugged).
+  Until WELCOME arrives it re-sends HELLO every 2 s: a HELLO sent the moment
+  a host opens the port can be lost on the host side (`cart.lobby` does this).
+- The host drops a link that stops reading: no write progress for 5 s, or a
+  64 KB backlog stuck for 1 s.
   A HELLO from a cart that is already in a room is a rejoin: it leaves the old
   room first, exactly like a LEAVE. The other members always get the ROSTER
   without the player before any ROSTER that has it again, so a rejoin is

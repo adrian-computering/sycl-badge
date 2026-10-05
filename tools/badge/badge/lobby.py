@@ -12,10 +12,10 @@ Protocol: fork/CART_SERIAL.md, "Lobby protocol v1". Three layers:
    close, see links.py). The relay thread processes events in arrival order,
    one frame at a time, so each room has a single global order; after each
    batch of events it hands every connection all of its pending bytes in one
-   write (coalescing). A link whose unsent backlog passes `queue_limit`
-   bytes while its writer has been stuck for `stall_time` seconds (the cart
-   stopped reading) is removed from the lobby and closed; frames are never
-   dropped for a connected player.
+   write (coalescing). A link that stops reading is removed from the lobby
+   and closed: no write progress for `dead_time` seconds, or a backlog past
+   `queue_limit` bytes while a write has been stuck for `stall_time`. Frames
+   are never dropped for a connected player.
 
 3. Sources feed links into the server. The seam for other transports:
 
@@ -327,15 +327,22 @@ class Conn:
         return len(self.buf)
 
     def _overflowing(self, backlog: int) -> bool:
-        # Overflow = a backlog past the limit while one write has been stuck
-        # for stall_time (the cart stopped reading), or a backlog past the hard
-        # cap. A big burst to a player that keeps up is fine.
+        # Overflow = no write progress at all for dead_time (the peer stopped
+        # reading, however little traffic it gets), a backlog past the limit
+        # while one write has been stuck for stall_time, or a backlog past the
+        # hard cap. A big burst to a player that keeps up is fine.
+        since = self.blocked_since
+        stuck = 0.0 if since is None else time.monotonic() - since
+        if stuck > self.server.dead_time:
+            return True
         limit = self.server.queue_limit
         if backlog <= limit:
             return False
-        since = self.blocked_since
-        stalled = since is not None and time.monotonic() - since > self.server.stall_time
-        return stalled or backlog > 16 * limit
+        return stuck > self.server.stall_time or backlog > 16 * limit
+
+    def stopped_reading(self) -> bool:
+        """Checked periodically, so a quiet link that stalls is still dropped."""
+        return not self.dead and self._overflowing(len(self.buf))
 
     def push(self, data: bytes) -> bool:
         """Queue bytes for the peer. False when the player must be dropped."""
@@ -427,11 +434,13 @@ class LobbyServer:
         reopen_delay: float = 2.0,
         stats_interval: float = 10.0,
         stall_time: float = 1.0,
+        dead_time: float = 5.0,
     ):
         self.log = log
         self.lobby = lobby or Lobby(log=log)
         self.queue_limit = queue_limit
         self.stall_time = stall_time
+        self.dead_time = dead_time
         self.reopen_delay = reopen_delay
         self.stats_interval = stats_interval
         self.events: "queue.Queue[tuple]" = queue.Queue()
@@ -543,6 +552,8 @@ class LobbyServer:
                         break
                     self._handle(ev)
                 self._flush()
+                for c in [c for c in self.conns.values() if c.stopped_reading()]:
+                    self._close(c.cid, "not reading for %.0f s: %d bytes queued" % (self.dead_time, c.queued()))
                 if self.stats_interval and time.time() - self._last_stats >= self.stats_interval:
                     self._print_stats()
         finally:

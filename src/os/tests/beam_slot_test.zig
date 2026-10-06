@@ -170,7 +170,7 @@ const TestRam = struct {
     }
 
     fn memory(t: TestRam) beam_slot.Memory {
-        return .{ .ram = ram, .ipc_end = ipc_end, .xip = xip, .bytes = t.bytes };
+        return .{ .ram = ram, .ipc_end = ipc_end, .bytes = t.bytes };
     }
 
     fn at(t: TestRam, addr: u32, len: usize) []u8 {
@@ -240,11 +240,16 @@ test "load copies the image, clears BSS, returns the descriptor offset" {
     for (t.bytes[c.bss_end - ram.start ..]) |b| try testing.expectEqual(fill_pattern, b);
 }
 
-test "load: entry point may be in cart_xip, BSS may be empty" {
+test "load: BSS may be empty" {
     const t = try TestRam.init(fill_pattern);
     defer t.deinit();
-    _ = try loadCart(.{ .entry = xip.start + 0x201 }, t);
     _ = try loadCart(.{ .bss_start = ram.end, .bss_end = ram.end }, t);
+}
+
+test "load refuses an entry point in cart_xip (a slot is RAM only)" {
+    const t = try TestRam.init(fill_pattern);
+    defer t.deinit();
+    try testing.expectError(error.AddressMismatch, loadCart(.{ .entry = xip.start + 0x201 }, t));
 }
 
 test "load refuses an image whose CRC fails" {
@@ -343,7 +348,7 @@ fn uf2LoadRam(file: []const u8, mem: beam_slot.Memory) Uf2Error!u32 {
         const payload = blk.getPayload();
         if (payload.len == 0) return error.InvalidUF2;
         const target = blk.header.target_addr;
-        if (target >= mem.xip.start and target + payload.len < mem.xip.end) return error.NotRamCart;
+        if (target >= xip.start and target + payload.len < xip.end) return error.NotRamCart;
         if (!(target >= mem.ram.start and target + payload.len <= mem.ram.end)) return error.AddressMismatch;
         if (descriptor == null) {
             if (beam_slot.findDescriptor(payload)) |off| descriptor = target + @as(u32, @intCast(off));
@@ -356,7 +361,7 @@ fn uf2LoadRam(file: []const u8, mem: beam_slot.Memory) Uf2Error!u32 {
     if (std.mem.readInt(u32, d[4..8], .little) != CART_VERSION_V1) return error.VersionMismatch;
     const bss_start = std.mem.readInt(u32, d[8..12], .little);
     const bss_end = std.mem.readInt(u32, d[12..16], .little);
-    try beam_slot.checkDescriptorV1(bss_start, bss_end, std.mem.readInt(u32, d[16..20], .little), mem.ram, mem.xip);
+    try beam_slot.checkDescriptorV1(bss_start, bss_end, std.mem.readInt(u32, d[16..20], .little), mem.ram, xip);
     @memset(mem.bytes[bss_start - mem.ram.start .. bss_end - mem.ram.start], 0);
     return d_addr - mem.ram.start;
 }

@@ -151,8 +151,6 @@ pub const Memory = struct {
     /// image may start at (the descriptor checks still use `ram`, as the UF2
     /// loader does).
     ipc_end: u32,
-    /// cart_xip region: a v1 entry point may also lie there.
-    xip: Region,
     /// Bytes of [ram.start, ram.end).
     bytes: []u8,
 
@@ -171,6 +169,9 @@ pub fn findDescriptor(payload: []align(4) const u8) ?usize {
 
 /// The UF2 loader's v1 descriptor rule (shared): BSS inside cart RAM, entry
 /// point in cart RAM or cart_xip, thumb bit set.
+/// An empty region: no entry point lies in it.
+pub const no_xip: Region = .{ .start = 0, .end = 0 };
+
 pub fn checkDescriptorV1(bss_start: u32, bss_end: u32, entry_point: u32, ram: Region, xip: Region) error{AddressMismatch}!void {
     const ram_start = ram.start;
     const ram_end = ram.end;
@@ -207,7 +208,10 @@ pub fn loadInto(slot: []const u8, mem: Memory) LoadError!u32 {
         abi.CART_VERSION_V1 => {
             const bss_start = readU32(desc, 8);
             const bss_end = readU32(desc, 12);
-            try checkDescriptorV1(bss_start, bss_end, readU32(desc, 16), mem.ram, mem.xip);
+            // A slot is a RAM image: its entry point must be in cart RAM, never
+            // in the old cart_xip region (the save store on firmware with
+            // cart saves).
+            try checkDescriptorV1(bss_start, bss_end, readU32(desc, 16), mem.ram, no_xip);
             @memset(mem.bytes[bss_start - mem.ram.start .. bss_end - mem.ram.start], 0);
         },
         else => return error.VersionMismatch,
@@ -249,13 +253,11 @@ pub fn validHeader() ?Header {
 /// Load the slot into cart RAM (core 1 must be stopped). Same result as the
 /// UF2 loader for a RAM cart.
 pub fn loadSlot() LoadError!@import("../ipc/mailbox.zig").MessageType.CartExecute {
-    const loader = @import("loader.zig");
     const area = slotArea() orelse return error.FileNotFound;
     const ram = badgeRam();
     const offset = try loadInto(area, .{
         .ram = ram,
         .ipc_end = badgeIpcEnd(),
-        .xip = .{ .start = loader.getCartXipStart(), .end = loader.getCartXipEnd() },
         .bytes = @as([*]u8, @ptrFromInt(ram.start))[0 .. ram.end - ram.start],
     });
     // Flush the store pipe before core 1 runs it, as the UF2 loader does.

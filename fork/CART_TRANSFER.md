@@ -73,7 +73,10 @@ IPC block (stricter than the UF2 loader's per-block rule, which starts at
 inside the image. The menu checks only this.
 **Launchable** additionally requires that `image_crc32` matches and that
 the descriptor passes the UF2 loader's v1 checks (magic, version, BSS and
-entry bounds, thumb bit).
+entry bounds, thumb bit), with one difference: the entry point must lie in
+cart RAM. The UF2 loader on this branch also accepts one in the old
+`cart_xip` region, but a slot is a RAM image, and on firmware with cart
+saves that region holds the save store.
 
 How this firmware reads those rules (`beam_slot.parseHeader`):
 

@@ -9,7 +9,9 @@ menu and launches it like any other cart.
 
 Branch `feature/cart-transfer`, based on `feature/ext-flash`, which it
 needs: carts can only write the external chip through that feature, and
-stock firmware lets a cart write no flash at all. Status: plan.
+stock firmware lets a cart write no flash at all. Status: OS side built
+and host-tested (`zig build test`), not yet run on a badge; the cart side
+is `carts/snouty-beam` in the monorepo.
 
 ## Why a raw slot and not a file on SYCLEXTRA
 
@@ -66,6 +68,17 @@ lies inside the image. The menu checks only this.
 the descriptor passes the UF2 loader's v1 checks (magic, version, BSS and
 entry bounds, thumb bit).
 
+How this firmware reads those rules (`beam_slot.parseHeader`):
+
+- `name_len` 1-47 and printable ASCII (0x20-0x7E) are part of "valid": the
+  menu shows the name, so a slot with a bad name is not listed.
+- "The descriptor lies inside the image" means the whole 20-byte v1
+  descriptor: `descriptor_offset + 20 <= image_len`, and 4-aligned.
+- The reserved bytes are not checked, so a later version can use them.
+- `image_crc32` is checked over the copy in cart RAM, after copying and
+  before anything reads the descriptor: it covers the bytes that will
+  run, including any flash read glitch on the way.
+
 **Write order** (the receiving cart, so a power cut never leaves a slot
 that looks valid but isn't):
 
@@ -77,27 +90,82 @@ that looks valid but isn't):
 ## OS changes
 
 - `os_flags` bit 5 = `cart_transfer`: this firmware lists and launches
-  the slot (ABI.md row). A transfer cart offers Receive only when bits 2
-  (`ext_flash`) and 5 are both set.
-- `src/os/loader/beam_slot.zig` (new): header parse and validation,
-  image CRC, and the loader path `loadSlot()`. It copies the image to
-  `load_addr`, then validates the descriptor, clears BSS and returns the
-  entry exactly like `loadUF2FromStorage`. The parse/validate code is
-  plain functions over a byte slice, so host tests cover it.
-- `storage.listCarts` reports the slot after both volumes, with
-  `visiting = .{ .volume = beam_slot.volume_id, ... }`. Its name is
-  the header's name with a mark that says it was received (the exact mark
-  depends on what the menu can draw). `loadUF2CartEntry` dispatches on
-  that volume id. Every `listCarts` user (menu, cart hash, console `ls`)
-  sees the slot with no other change.
+  the slot. The OS sets it at cart start whenever bit 2 (`ext_flash`) is
+  set, since the slot lives on the chip. A transfer cart offers Receive
+  only when bits 2 and 5 are both set; the cart API's `cart_transfer()`
+  checks both (false in the simulator).
+- `src/os/loader/beam_slot.zig` (new): header parse and validation
+  (`parseHeader`), image CRC, and the loader path. `loadInto(slot, mem)`
+  copies the image to `load_addr`, checks the CRC over the copy, then
+  checks the descriptor, clears BSS and returns the descriptor offset;
+  `loadSlot()` runs it on the real chip and cart RAM and returns the same
+  `CartExecute` as `loadUF2FromStorage` gives a RAM cart. The loading
+  core takes the RAM bounds and the bytes backing them as a parameter, so
+  host tests load into a buffer. The UF2 loader now calls the same
+  `findDescriptor` and `checkDescriptorV1`, so both paths find and check
+  the descriptor with one piece of code.
+- `storage.listCarts` reports a valid slot (header checks only) after both
+  volumes, with `visiting = .{ .volume = beam_slot.volume_id (0xBE),
+  .start_cluster = 0, .size = image_len }`. `loadUF2CartInfo` dispatches
+  that volume id to `beam_slot.loadSlot()`, which covers the menu
+  (`loadUF2CartEntry`) and the name-based path.
+- **Menu name**: `*` followed by the header's name, e.g. `*Snouty Pong`
+  (with the cursor: `>*Snouty Pong`). The menu font is 8x8 ASCII, 20
+  columns, one color per row, so a prefix is the mark that stays visible
+  however long the name is. `*` can't occur in a FAT file name, so the
+  row never matches a file on either drive.
+- Every `listCarts` user sees the slot with no other change: the menu
+  count/collect/draw (the `.UF2` stripping doesn't apply, the name has no
+  extension) and the console's `cart list` and completions. The menu's
+  change hash covers name and `image_len`: the slot appearing,
+  disappearing (header erased, step 1 of the write order) or changing name
+  or size redraws the menu; a new cart with the same name and size needs
+  no redraw, as launching always reads the slot afresh.
+- `findCart` finds the slot by its listed name (case-insensitive) after
+  both drives, and `countCarts` counts it, so console `cart run`/`load`
+  and the (disabled) single-cart autostart can launch it. `deleteCart`
+  does not touch the slot (it only deletes drive files).
+- Errors use the existing messages: a slot that is no longer valid at
+  launch reads "Cart not found", an image CRC mismatch "Read error", a
+  bad descriptor "Wrong address" or "Bad Cart Version".
+- **XIP cache**: the menu and loader read the slot through the cached
+  window at `0x11000000`. That is safe: every cart erase/program
+  (`EXT_FLASH_REQ`, `ext_flash.eraseRaw`/`programRaw`) ends with the
+  bootrom's `flash_flush_cache`, which invalidates the whole XIP cache
+  (shared by both windows and both cores), so neither the cart's
+  read-back nor the OS sees stale lines.
+- Bounds: the image may cover exactly what a UF2 RAM cart may, i.e.
+  `[__process_ram_start__, __process_ram_end__)` (0x20020000-0x20080000).
+  Process RAM holds nothing the OS uses while loading a RAM cart (the UF2
+  loader's flash buffer there is only used for XIP carts), and the IPC
+  block at its start is rewritten at cart start.
 - No new IPC words or mailbox messages.
+
+### Cart ABI
+
+| Where | Field | Meaning |
+|---|---|---|
+| `os_flags` bit 5 | `cart_transfer` | this OS lists and launches the received-cart slot (set only with bit 2) |
+
+Row for `fork/ABI.md` (on fork main) when this branch is merged:
+`| 5 | cart_transfer | fork feature/cart-transfer ([CART_TRANSFER.md](CART_TRANSFER.md)) |`,
+with the free range becoming `6-15`.
 
 ## Tests
 
-- Host tests (`zig build test`): golden header bytes, every validity rule
-  (each field broken in turn), a CRC mismatch is refused at launch, and a
-  fixture slot made by the monorepo's flattener from a real cart UF2
-  loads into a RAM buffer byte-identical to what the UF2 path produces.
+- Host tests (`zig build test`, `src/os/tests/beam_slot_test.zig`):
+  golden header bytes built from the table above, every validity rule
+  (each field broken in turn), a CRC mismatch is refused at launch, the
+  v1 descriptor checks, and slot-vs-UF2 loads compared byte for byte in a
+  RAM buffer (the UF2 side runs the loader's RAM-cart path: same parser,
+  bounds, descriptor search and checks). Cases: a synthetic cart with a
+  gap; `src/os/tests/fixtures/snouty-pong.uf2` flattened by the test's
+  own copy of the flattening rule; and, when present,
+  `src/os/tests/fixtures/beam_slot_pong.bin` (header sector + image, as
+  the monorepo's flattener writes it from that same `snouty-pong.uf2`):
+  its header must match the test's flattening and it must load like the
+  UF2. Without the `.bin` that test is skipped. Replace both fixtures
+  together: the `.bin` must come from the committed `.uf2`.
 - Build: `zig build -Dsimulator=false`, and the full build including the
   simulator.
 

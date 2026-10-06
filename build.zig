@@ -172,6 +172,10 @@ pub fn build(b: *Build) void {
             .optimize = .Debug,
         }),
     });
+    // Test fixtures are optional files read at run time (tests skip without them).
+    const test_options = b.addOptions();
+    test_options.addOptionPathDirectory("fixtures_dir", b.path("src/os/tests/fixtures"));
+    unit_tests.root_module.addOptions("test_options", test_options);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 

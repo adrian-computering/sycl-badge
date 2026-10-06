@@ -3,6 +3,7 @@
 const std = @import("std");
 const microzig = @import("microzig");
 const storage = @import("storage.zig");
+const beam_slot = @import("beam_slot.zig");
 const uf2 = @import("uf2.zig");
 const rom = @import("../drivers/rom.zig");
 const interrupt = microzig.interrupt;
@@ -435,9 +436,7 @@ fn loadUF2FromStorage(cart_info: storage.CartInfo) LoadError!mailbox.MessageType
 
             if (ram_cart_descriptor == null) {
                 // See if we can find the cart descriptor
-                const data_as_u32 = std.mem.bytesAsSlice(u32, payload[0..std.mem.alignBackward(usize, payload.len, @alignOf(u32))]);
-                if (std.mem.indexOfScalar(u32, data_as_u32, abi.CART_MAGIC)) |index| {
-                    const byte_offset = index * @sizeOf(u32);
+                if (beam_slot.findDescriptor(payload)) |byte_offset| {
                     ram_cart_descriptor = @ptrFromInt(block.header.target_addr + byte_offset);
                 }
             }
@@ -472,16 +471,14 @@ fn loadUF2FromStorage(cart_info: storage.CartInfo) LoadError!mailbox.MessageType
                 const bss_start = @intFromPtr(descriptor.bss_start);
                 const bss_end = @intFromPtr(descriptor.bss_end);
                 const entry_point = @intFromPtr(descriptor.entry_point);
-                // Verify the pointers
-                if (bss_start < cart_ram_start or bss_start > cart_ram_end or
-                    bss_end < cart_ram_start or bss_end > cart_ram_end or
-                    bss_start > bss_end or
-                    !(entry_point >= cart_ram_start and entry_point < cart_ram_end or
-                        entry_point >= cart_xip_start and entry_point < cart_xip_end) or
-                    entry_point & 1 == 0) // entry_point must be thumb
-                {
-                    return LoadError.AddressMismatch;
-                }
+                // Verify the pointers (rule shared with the received-cart slot)
+                try beam_slot.checkDescriptorV1(
+                    bss_start,
+                    bss_end,
+                    entry_point,
+                    .{ .start = cart_ram_start, .end = cart_ram_end },
+                    .{ .start = cart_xip_start, .end = cart_xip_end },
+                );
 
                 // Clear BSS
                 const bss = @as([*]u8, @ptrFromInt(bss_start))[0 .. bss_end - bss_start];

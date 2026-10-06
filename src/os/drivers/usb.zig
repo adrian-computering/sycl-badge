@@ -110,8 +110,34 @@ const SetupProcessor = setup.RequestPacketProcessor(.{
         .get_buffer = get_buffer,
         .clear_endpoint_halt = clear_endpoint_halt,
         .stall = stall,
+        .set_configuration = on_set_configuration,
     },
 });
+
+// Cart files (fork/CART_FILES.md) must not write the drive while a host has
+// it: a host caches the FAT and directory and writes its stale copy back.
+// "Has it" = configured since the last bus reset, and start of frame packets
+// still arriving (VBUS detection is forced on, so an unplugged cable looks
+// like a suspended bus). A charger never configures the device.
+var host_configured: bool = false;
+var host_bus_active: bool = true;
+/// Bumped whenever a host (re)appears: a SET_CONFIGURATION, or frames resuming
+/// on a configured bus. A file opened before a bump is refused.
+var host_generation: u32 = 0;
+
+fn on_set_configuration(value: u16) void {
+    host_configured = value != 0;
+    host_generation +%= 1;
+}
+
+/// A USB host has configured the device and its bus is active.
+pub fn hostHasDrive() bool {
+    return host_configured and host_bus_active;
+}
+
+pub fn hostGeneration() u32 {
+    return host_generation;
+}
 
 fn get_max_lun(_: ?*anyopaque) u4 {
     // One LUN per storage volume: the main drive, plus the external flash drive.
@@ -522,6 +548,7 @@ pub fn poll() void {
     if (interrupts.BUS_RESET == 1) {
         log.debug("BUS_RESET", .{});
         USB.ADDR_ENDP.write(.{ .ADDRESS = 0 });
+        host_configured = false;
 
         msc_driver.reset();
         console.reset();
@@ -595,6 +622,8 @@ pub fn poll() void {
     // (VBUS detection is forced on, so unplugging looks like a suspend): treat
     // both serial ports as closed so writers do not wait for a reader
     const suspended = !bus_active();
+    if (host_configured and !suspended and !host_bus_active) host_generation +%= 1;
+    host_bus_active = !suspended;
     console.port.bus_suspended = suspended;
     cart_driver.bus_suspended = suspended;
 

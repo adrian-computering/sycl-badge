@@ -85,7 +85,10 @@ pub const CartIPCData = extern struct {
         /// external flash's cart area (fork/CART_TRANSFER.md). Only set
         /// together with ext_flash.
         cart_transfer: bool = false,
-        _reserved: u10 = 0,
+        /// Carts can create files on the USB drives through CART_FILE_REQ
+        /// (fork/CART_FILES.md).
+        cart_files: bool = false,
+        _reserved: u9 = 0,
     },
 
     cart_dma_channels: u16,            // x150EC..x150EE
@@ -190,6 +193,9 @@ pub const EXT_FLASH_DONE       : u8 = 0x2B;
 /// The OS answers through the SaveRequest struct only, never through the FIFO.
 /// (0x2B is EXT_FLASH_REQ, fork/EXT_FLASH.md.)
 pub const CART_SAVE_REQ        : u8 = 0x2C;
+/// Cart file request (cart -> OS). Payload = (request address - 0x20000000) / 4.
+/// The OS answers through the FileRequest struct only (fork/CART_FILES.md).
+pub const CART_FILE_REQ        : u8 = 0x2D;
 // zig fmt: on
 
 pub const ExtFlashOp = api.ExtFlashOp;
@@ -275,6 +281,77 @@ pub const EXIT_WORD_READY: u32 = 2; // written by the cart
 comptime {
     std.debug.assert(@sizeOf(SaveStat) == 32);
     std.debug.assert(@sizeOf(SaveListEntry) == 40);
+}
+
+// ┌───────────────────────────────────────────────────────────────────────────┐
+// │ Cart files, ABI v1 (frozen; fork/CART_FILES.md)                           │
+// └───────────────────────────────────────────────────────────────────────────┘
+
+pub const FILE_MAGIC: u32 = 0x314C4946; // "FIL1"
+pub const FILE_ABI_VERSION: u32 = 1;
+
+/// Lives in cart RAM (0x20035100..0x20080000), 4-byte aligned, 64 bytes.
+pub const FileRequest = extern struct {
+    magic: u32 = FILE_MAGIC,
+    op: FileOp,
+    state: FileState = .idle, // idle -> pending (cart) -> busy -> done (OS)
+    status: FileStatus = .ok, // written by the OS
+    volume: u32 = 0, // 0 = SYCLBADGE, 1 = SYCLEXTRA
+    offset: u32 = 0, // create: total file size; write: byte offset
+    buf: u32 = 0, // address in cart RAM
+    len: u32 = 0, // bytes at buf
+    result: u32 = 0, // per op, written by the OS
+    flags: u32 = 0, // written by the OS on every reply, FileFlags
+    _reserved: [6]u32 = @splat(0),
+
+    comptime {
+        std.debug.assert(@sizeOf(FileRequest) == 64);
+    }
+};
+
+pub const FileOp = enum(u32) {
+    probe = 1, // result = ABI version (1)
+    stat = 2, // volume -> result = free bytes; buf/len optional: FileStat
+    create = 3, // volume, buf/len = name, offset = size: reserve space, open
+    write = 4, // offset (must equal bytes written so far), buf, len 1..4096
+    commit = 5, // all bytes written: link the file into the FAT and directory
+    abort = 6, // drop the open file; nothing on the drive changes
+    _,
+};
+
+pub const FileState = enum(u32) { idle = 0, pending = 1, busy = 2, done = 3, _ };
+
+pub const FileStatus = enum(u32) {
+    ok = 0,
+    exists = 1, // create: a file with this name (long or 8.3) exists
+    no_space = 2, // create: not enough free clusters
+    dir_full = 3, // create: not enough free root directory entries
+    bad_request = 4, // bad op/volume/offset/len, or wrong order
+    bad_buffer = 5, // buf..buf+len not inside cart RAM
+    bad_name = 6, // name rules (fork/CART_FILES.md)
+    usb_host = 7, // a USB host has the drive: refused
+    busy = 8, // another request is in flight
+    no_volume = 9, // volume index not mounted
+    not_open = 10, // write/commit/abort with no open file
+    io_error = 11, // read-back after program did not match
+    _,
+};
+
+pub const FileFlags = packed struct(u32) {
+    usb_host: bool, // a USB host has configured the device right now
+    ext_volume: bool, // volume 1 (SYCLEXTRA) is mounted
+    _: u30 = 0,
+};
+
+pub const FileStat = extern struct {
+    free_bytes: u32,
+    free_root_entries: u32,
+    cluster_size: u32,
+    total_bytes: u32,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(FileStat) == 16);
 }
 
 pub const PresentFlags = packed struct(u32) {

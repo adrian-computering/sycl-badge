@@ -25,6 +25,9 @@ pub const Config = struct {
         get_buffer: *const fn () []const u8,
         stall: *const fn (ep: types.Endpoint) void,
         clear_endpoint_halt: *const fn (ep: types.Endpoint) void,
+        /// Told about every accepted SET_CONFIGURATION (fork: cart files
+        /// refuse to write while a host has the drive).
+        set_configuration: ?*const fn (value: u16) void = null,
     };
 };
 
@@ -173,6 +176,7 @@ pub fn RequestPacketProcessor(comptime config: Config) type {
                         return;
                     }
 
+                    if (config.callbacks.set_configuration) |f| f(pkt.value.native());
                     self.queue_in_xfer("", pkt.length.native());
                 },
                 .clear_feature_device => {

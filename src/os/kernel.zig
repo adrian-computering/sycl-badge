@@ -25,6 +25,7 @@ const loader = @import("loader/loader.zig");
 const multicore = @import("system/multicore.zig");
 const terry = @import("system/terry.zig");
 const saves = @import("system/saves.zig");
+const cart_files = @import("system/cart_files.zig");
 const mailbox = @import("ipc/mailbox.zig");
 const abi = @import("cart/os_abi.zig");
 const Controls = abi.Controls;
@@ -188,6 +189,8 @@ pub noinline fn main() !void {
 
         // Cart saves: at most one flash step per pass.
         saves.poll();
+        // Cart files: at most one 4 KB block written per pass.
+        cart_files.poll();
 
         // Check if cart is running - controls both button handling and display updates
         // Check for both .ready and .running states (cart is active from load until stop)
@@ -498,6 +501,8 @@ fn handle_cart_message(msg: u32, sync_time: *bool) void {
         mailbox.send((@as(u32, abi.EXT_FLASH_DONE) << 24) | @backingInt(status));
     } else if (mailbox.MessageType.getType(msg) == abi.CART_SAVE_REQ) {
         saves.onMessage(mailbox.MessageType.getPayload(msg));
+    } else if (mailbox.MessageType.getType(msg) == abi.CART_FILE_REQ) {
+        cart_files.onMessage(mailbox.MessageType.getPayload(msg));
     }
     // Other messages (e.g. CART_FINISHED) handled by loader state machine.
 }
@@ -836,6 +841,7 @@ fn init_cart_ipc_data() void {
         .ext_flash = ext_flash.present(),
         .ext_volume = @backingInt(storage.ext_volume_state),
         .cart_transfer = ext_flash.present(), // the slot lives on the chip
+        .cart_files = true,
     };
     abi.ipc_data.ext_flash_size_kb = @intCast(ext_flash.size() / 1024);
     abi.ipc_data.ext_flash_cart_offset_kb = @intCast(ext_flash.cartAreaOffset() / 1024);

@@ -12,6 +12,7 @@ const shared_mem = @import("../ipc/shared_mem.zig");
 const timer = @import("../drivers/timer.zig");
 const cart_serial = @import("cart_serial.zig");
 const saves = @import("saves.zig");
+const cart_files = @import("cart_files.zig");
 
 const CriticalSection = interrupt.CriticalSection;
 const SIO = peripherals.SIO;
@@ -126,6 +127,8 @@ pub fn haltCore1() void {
     // Forget the stopped cart's exit word and abort its in-flight save request
     // (the store is copy-on-write, so an abort leaves the previous data intact).
     saves.cartReset();
+    // And its open file, if any (stopped mid-commit: lost clusters at worst).
+    cart_files.cartReset();
 
     if (!core1_running) {
         return;
@@ -182,6 +185,7 @@ pub fn executeCart(msg: mailbox.MessageType.CartExecute) bool {
 
     // A new cart starts with no exit word and no save request in flight.
     saves.cartReset();
+    cart_files.cartReset();
 
     // Send CART_EXECUTE message to Core 1
     mailbox.send(@bitCast(msg));

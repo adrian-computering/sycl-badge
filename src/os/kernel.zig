@@ -790,6 +790,7 @@ fn init_cart_ipc_data() void {
         .os_clear_supported = false, // TODO OS clear
         .ext_flash = ext_flash.present(),
         .ext_volume = @backingInt(storage.ext_volume_state),
+        .cart_transfer = ext_flash.present(), // the slot lives on the chip
     };
     abi.ipc_data.ext_flash_size_kb = @intCast(ext_flash.size() / 1024);
     abi.ipc_data.ext_flash_cart_offset_kb = @intCast(ext_flash.cartAreaOffset() / 1024);

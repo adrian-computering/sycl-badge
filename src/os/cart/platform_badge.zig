@@ -178,6 +178,10 @@ pub fn ext_flash_volume() u8 {
     return ipc_data.os_flags.ext_volume;
 }
 
+pub fn cart_transfer() bool {
+    return ipc_data.os_flags.ext_flash and ipc_data.os_flags.cart_transfer;
+}
+
 var ext_flash_req: abi.ExtFlashRequest align(4) = undefined;
 
 /// Ask core 0 to erase or program the external flash and wait for it. This

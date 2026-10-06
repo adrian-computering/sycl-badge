@@ -11,11 +11,12 @@
 //!   never a cross-linked or half-visible file.
 //! - abort: forget the reservation.
 //!
-//! Writes are stepped: one step writes the sectors of one 4 KB erase block,
-//! flushes and reads them back (CRC), so a caller can poll USB and audio
-//! between erases. Sectors are visited in ascending LBA order (data clusters
-//! ascending, FAT 1 < FAT 2 < root directory), so every block is erased once
-//! per step.
+//! Writes are stepped: a step erases and programs at most one 4 KB block
+//! (through the sector cache's flush) and reads its sectors back (CRC), so a
+//! caller can poll USB and audio between erases. Sectors are visited in
+//! ascending LBA order (data clusters ascending, FAT 1 < FAT 2 < root
+//! directory). A data block the next write continues in stays in the sector
+//! cache until then, so sequential 4 KB writes erase each block once.
 const std = @import("std");
 const names = @import("fat_names.zig");
 
@@ -213,10 +214,16 @@ pub const Writer = struct {
     cache: [sector_size]u8 align(4) = undefined,
     cache_lba: ?u32 = null,
     lfn: [256]u8 = undefined,
-    /// Sectors written in the current step, read back after its flush.
+    /// Sectors written since the last flush (all in one erase block), read
+    /// back after the next flush.
     step_lba: [sectors_per_block]u32 = undefined,
     step_crc: [sectors_per_block]u32 = undefined,
     step_n: usize = 0,
+    /// Erase block holding this file's unflushed data sectors (in the sector
+    /// cache), kept across writes when the next write continues in it, so a
+    /// block is erased once rather than once per write. It is free space, so
+    /// losing it to a power cut or an abort changes nothing on the drive.
+    held: ?u32 = null,
 
     const Commit = struct {
         phase: enum { prepare, fat, dir } = .prepare,
@@ -278,6 +285,8 @@ pub const Writer = struct {
         w.first_cluster = if (need == 0) 0 else w.nextReserved(1).?;
         w.cursor = w.first_cluster;
         w.written = 0;
+        w.held = null;
+        w.step_n = 0;
         w.size = size;
         @memcpy(w.name_buf[0..file_name.len], file_name);
         w.name_len = file_name.len;
@@ -308,17 +317,20 @@ pub const Writer = struct {
     }
 
     /// Drop the open file. Nothing the directory or FAT can see has changed.
+    /// Touches no flash: a held block of data stays in the sector cache (free
+    /// clusters' contents, flushed by whoever writes next).
     pub fn abort(w: *Writer) void {
         w.open = false;
         w.job = .none;
         w.src = &.{};
+        w.held = null;
+        w.step_n = 0;
         @memset(&w.reserved, 0);
     }
 
     /// Advance the write or commit in flight by one erase block.
     pub fn step(w: *Writer) Step {
         w.cache_lba = null;
-        w.step_n = 0;
         return switch (w.job) {
             .none => .{ .done = .bad_request },
             .write => w.stepWrite(),
@@ -361,11 +373,17 @@ pub const Writer = struct {
     // ── stepping ───────────────────────────────────────────────────────────
 
     fn stepWrite(w: *Writer) Step {
-        var block: ?u32 = null;
         while (w.src_done < w.src.len) {
             const lba = w.geo.data_start + (@as(u32, w.cursor) - 2);
-            if (block) |b| if (b != lba / sectors_per_block) break;
-            block = lba / sectors_per_block;
+            if (w.held) |h| if (h != lba / sectors_per_block) {
+                // The next sector is in another block: this step's erase.
+                if (!w.flushHeld()) {
+                    w.job = .none;
+                    return .{ .done = .io_error };
+                }
+                return .more;
+            };
+            w.held = lba / sectors_per_block;
 
             const in_sector = w.written % sector_size;
             // A sector this file already started is read back; a new one
@@ -380,17 +398,32 @@ pub const Writer = struct {
                 w.cursor = w.nextReserved(w.cursor).?;
             }
         }
-        if (!w.flushAndVerify()) {
+        // Keep the last block for the next write if the file continues in it.
+        const next_lba = w.geo.data_start + (@as(u32, w.cursor) - 2);
+        const continues = w.written < w.size and w.held != null and w.held.? == next_lba / sectors_per_block;
+        if (!continues and !w.flushHeld()) {
             w.job = .none;
             return .{ .done = .io_error };
         }
-        if (w.src_done < w.src.len) return .more;
         w.job = .none;
         w.src = &.{};
         return .{ .done = .ok };
     }
 
+    fn flushHeld(w: *Writer) bool {
+        w.held = null;
+        return w.flushAndVerify();
+    }
+
     fn stepCommit(w: *Writer) Step {
+        if (w.held != null) {
+            // The last data block first, as its own step.
+            if (!w.flushHeld()) {
+                w.abort();
+                return .{ .done = .io_error };
+            }
+            return .more;
+        }
         if (w.commit.phase == .prepare) {
             const status = w.prepareCommit();
             if (status != .ok) {
@@ -574,10 +607,19 @@ pub const Writer = struct {
     // ── helpers ────────────────────────────────────────────────────────────
 
     fn put(w: *Writer, lba: u32, buf: *const [sector_size]u8) void {
-        std.debug.assert(w.step_n < sectors_per_block);
-        w.step_lba[w.step_n] = lba;
-        w.step_crc[w.step_n] = std.hash.Crc32.hash(buf);
-        w.step_n += 1;
+        const crc = std.hash.Crc32.hash(buf);
+        for (w.step_lba[0..w.step_n], w.step_crc[0..w.step_n]) |l, *c| {
+            if (l == lba) {
+                // A partial sector written again by the next write.
+                c.* = crc;
+                break;
+            }
+        } else {
+            std.debug.assert(w.step_n < sectors_per_block);
+            w.step_lba[w.step_n] = lba;
+            w.step_crc[w.step_n] = crc;
+            w.step_n += 1;
+        }
         if (w.cache_lba == lba) w.cache_lba = null;
         w.disk.write(w.disk.ctx, lba, buf);
     }
@@ -586,11 +628,12 @@ pub const Writer = struct {
     fn flushAndVerify(w: *Writer) bool {
         w.disk.flush(w.disk.ctx);
         w.cache_lba = null;
-        for (w.step_lba[0..w.step_n], w.step_crc[0..w.step_n]) |lba, crc| {
+        const n = w.step_n;
+        w.step_n = 0;
+        for (w.step_lba[0..n], w.step_crc[0..n]) |lba, crc| {
             w.disk.read(w.disk.ctx, lba, &w.cache);
             if (std.hash.Crc32.hash(&w.cache) != crc) return false;
         }
-        w.step_n = 0;
         return true;
     }
 

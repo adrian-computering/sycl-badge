@@ -233,6 +233,33 @@ pub fn save_transact(op: abi.SaveOp, key: []const u8, buf: ?[*]u8, len: u32, res
 
 // ┌───────────────────────────────────────────────────────────────────────────┐
 // │                                                                           │
+// │ Cart Files                                                                │
+// │                                                                           │
+// └───────────────────────────────────────────────────────────────────────────┘
+
+/// The simulator always has cart files: volume 0 is the SYCLBADGE directory
+/// next to the simulator binary (src/simulator/cart_files.zig).
+pub fn cart_files() bool {
+    return true;
+}
+
+var file_flags_last: abi.FileFlags = .{ .usb_host = false, .ext_volume = false };
+
+pub fn file_flags() abi.FileFlags {
+    return file_flags_last;
+}
+
+pub fn file_transact(op: abi.FileOp, volume: u32, offset: u32, buf: ?[*]u8, len: u32, result: *u32) abi.FileStatus {
+    var req: abi.FileRequest = .{ .op = op, .volume = volume, .offset = offset, .len = len };
+    req.state = .pending;
+    simulator_io_block.api.file_request(&req, buf);
+    file_flags_last = @bitCast(req.flags);
+    result.* = req.result;
+    return req.status;
+}
+
+// ┌───────────────────────────────────────────────────────────────────────────┐
+// │                                                                           │
 // │ Other Functions                                                           │
 // │                                                                           │
 // └───────────────────────────────────────────────────────────────────────────┘

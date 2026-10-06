@@ -20,6 +20,15 @@ pub const SaveListEntry = os_abi.SaveListEntry;
 pub const SAVE_MAGIC = os_abi.SAVE_MAGIC;
 pub const SAVE_ABI_VERSION = os_abi.SAVE_ABI_VERSION;
 
+pub const FileRequest = os_abi.FileRequest;
+pub const FileOp = os_abi.FileOp;
+pub const FileState = os_abi.FileState;
+pub const FileStatus = os_abi.FileStatus;
+pub const FileFlags = os_abi.FileFlags;
+pub const FileStat = os_abi.FileStat;
+pub const FILE_MAGIC = os_abi.FILE_MAGIC;
+pub const FILE_ABI_VERSION = os_abi.FILE_ABI_VERSION;
+
 pub const SimulatorAPI = extern struct {
     is_running: *const fn () callconv(.c) bool,
     micros_since_boot: *const fn () callconv(.c) u64,
@@ -40,6 +49,10 @@ pub const SimulatorAPI = extern struct {
     /// is a file-backed fake NOR). `buf` stands in for req.buf, which can't hold
     /// a host pointer.
     save_request: *const fn (req: *SaveRequest, buf: ?[*]u8) callconv(.c) void,
+    /// Serves one cart file request synchronously (fork/CART_FILES.md): files
+    /// go to a SYCLBADGE directory next to the simulator binary. `buf` stands
+    /// in for req.buf (mutable: stat writes through it).
+    file_request: *const fn (req: *FileRequest, buf: ?[*]u8) callconv(.c) void,
 };
 
 pub const SimulatorIO = extern struct {

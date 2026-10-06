@@ -43,6 +43,9 @@ pub fn build(b: *Build) void {
                     .{ .name = "save_store", .module = b.createModule(.{
                         .root_source_file = b.path("src/os/system/save_store.zig"),
                     }) },
+                    .{ .name = "fat_write", .module = b.createModule(.{
+                        .root_source_file = b.path("src/os/loader/fat_write.zig"),
+                    }) },
                 },
             }),
         });
@@ -169,6 +172,12 @@ pub fn build(b: *Build) void {
         .name = "save-test",
         .optimize = .ReleaseSmall,
         .root_source_file = b.path("carts/save-test/main.zig"),
+    });
+    // Fork: cart files test cart (fork/CART_FILES.md)
+    add_cart(b, &dep, .{
+        .name = "file-test",
+        .optimize = .ReleaseSmall,
+        .root_source_file = b.path("carts/file-test/main.zig"),
     });
     add_cart(b, &dep, .{
         .name = "empty-cart",

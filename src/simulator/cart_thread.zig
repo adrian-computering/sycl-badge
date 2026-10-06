@@ -4,6 +4,7 @@ const sdl = @import("sdl3");
 const root = @import("root");
 const serial = @import("serial.zig");
 const saves = @import("saves.zig");
+const cart_files = @import("cart_files.zig");
 
 extern fn cart_must_call_export_start_code() void;
 extern var simulator_io_block: abi.SimulatorIO;
@@ -161,7 +162,12 @@ const sim_api: abi.SimulatorAPI = .{
     .serial_bytes_available = &serial.cart_serial_bytes_available,
     .serial_space_available = &serial.cart_serial_space_available,
     .save_request = &cart_save_request,
+    .file_request = &cart_file_request,
 };
+
+fn cart_file_request(req: *abi.FileRequest, buf: ?[*]u8) callconv(.c) void {
+    cart_files.handle(req, buf);
+}
 
 fn cart_save_request(req: *abi.SaveRequest, buf: ?[*]u8) callconv(.c) void {
     saves.handle(req, buf, cart_micros_since_boot());

@@ -770,6 +770,84 @@ noinline fn save_wait(req: *abi.SaveRequest, mask_irqs: bool, timeout_us: u64) b
 
 // ┌───────────────────────────────────────────────────────────────────────────┐
 // │                                                                           │
+// │ Cart Files (ABI v1, see os_abi.zig and fork/CART_FILES.md)                │
+// │                                                                           │
+// └───────────────────────────────────────────────────────────────────────────┘
+
+pub fn cart_files() bool {
+    return ipc_data.os_flags.cart_files;
+}
+
+/// One request at a time, in static RAM (a reply after a timeout must not
+/// land in a dead stack frame).
+var file_req: abi.FileRequest align(4) = .{ .op = .probe };
+var file_flags_last: abi.FileFlags = .{ .usb_host = false, .ext_volume = false };
+const file_probe_timeout_us: u64 = 250_000;
+/// A request the OS hasn't picked up after this long is abandoned (Busy).
+const file_pending_timeout_us: u64 = 2_000_000;
+
+pub fn file_flags() abi.FileFlags {
+    return file_flags_last;
+}
+
+/// One request, blocking until the OS marks it done. Returns .busy if the OS
+/// never picked it up.
+pub fn file_transact(op: abi.FileOp, volume: u32, offset: u32, buf: ?[*]u8, len: u32, result: *u32) abi.FileStatus {
+    const r: *volatile abi.FileRequest = &file_req;
+    r.* = .{
+        .op = op,
+        .volume = volume,
+        .offset = offset,
+        .buf = if (buf) |b| @intFromPtr(b) else 0,
+        .len = len,
+    };
+    // Core 0 switches XIP off while it erases/programs for these: keep this
+    // core's interrupts masked meanwhile (their vectors may be in flash).
+    const mask = op == .create or op == .write or op == .commit;
+    const timeout = if (op == .probe) file_probe_timeout_us else file_pending_timeout_us;
+    if (!file_wait(&file_req, mask, timeout)) {
+        result.* = 0;
+        return .busy;
+    }
+    file_flags_last = @bitCast(r.flags);
+    result.* = r.result;
+    return r.status;
+}
+
+/// As save_wait, for a FileRequest and CART_FILE_REQ.
+noinline fn file_wait(req: *abi.FileRequest, mask_irqs: bool, timeout_us: u64) bool {
+    const r: *volatile abi.FileRequest = req;
+    r.state = .pending;
+    asm volatile ("dmb" ::: .{ .memory = true });
+
+    const primask: u32 = asm volatile ("mrs %[r], primask"
+        : [r] "=r" (-> u32),
+    );
+    if (mask_irqs) asm volatile ("cpsid i" ::: .{ .memory = true });
+    defer if (mask_irqs) asm volatile ("msr primask, %[p]"
+        :
+        : [p] "r" (primask),
+        : .{ .memory = true });
+
+    const offset: u32 = @intCast((@intFromPtr(req) - 0x20000000) >> 2);
+    fifo_send((@as(u32, abi.CART_FILE_REQ) << 24) | offset);
+
+    const start = micros_since_boot();
+    while (true) {
+        asm volatile ("dmb" ::: .{ .memory = true });
+        const state = r.state;
+        if (state == .done) return true;
+        if (state == .pending and micros_since_boot() - start >= timeout_us) {
+            r.magic = 0;
+            asm volatile ("dmb" ::: .{ .memory = true });
+            return false;
+        }
+        if (fifo_try_recv()) |msg| handle_os_message(msg);
+    }
+}
+
+// ┌───────────────────────────────────────────────────────────────────────────┐
+// │                                                                           │
 // │ Other Functions                                                           │
 // │                                                                           │
 // └───────────────────────────────────────────────────────────────────────────┘

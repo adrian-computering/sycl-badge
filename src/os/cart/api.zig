@@ -1099,6 +1099,137 @@ pub fn exit_ready() void {
 
 // ┌───────────────────────────────────────────────────────────────────────────┐
 // │                                                                           │
+// │ Cart Files                                                                │
+// │                                                                           │
+// └───────────────────────────────────────────────────────────────────────────┘
+//
+// Create a new file in the root directory of a USB drive: volume 0 is
+// SYCLBADGE, volume 1 SYCLEXTRA (when the external flash is mounted). Needs an
+// OS with cart files (os_flags bit 6, ABI v1, fork/CART_FILES.md); elsewhere
+// cart_files() is false and every call returns error.Unsupported.
+//
+//     try cart.file_create(0, "my-cart.uf2", size);   // reserve space, open
+//     try cart.file_write(0, bytes[0..n]);            // sequential, any length
+//     ...                                             // (more writes)
+//     try cart.file_commit();                         // now it is on the drive
+//
+// On any error after create, call file_abort(): the drive stays as it was.
+// Writes are refused (error.UsbHost) while a computer has the drive: ask the
+// player to unplug it. create/write/commit block the cart (about 0.1 s per
+// 4 KB written); its streaming audio pauses meanwhile.
+
+pub const FileStat = os_abi.FileStat;
+pub const FileFlags = os_abi.FileFlags;
+/// Longest name (bytes): printable ASCII, none of \ / : * ? " < > |, no
+/// leading or trailing space or dot.
+pub const file_max_name: u32 = 63;
+/// The OS takes at most this many bytes per write request; file_write loops.
+pub const file_max_write: u32 = 4096;
+
+pub const FileError = error{
+    /// The OS has no cart files (stock firmware).
+    Unsupported,
+    /// create: a file with this name (long or 8.3, any case) exists.
+    Exists,
+    /// create: not enough free space for the size.
+    NoSpace,
+    /// create: not enough free root directory entries.
+    DirFull,
+    /// Bad volume/offset/length, or calls out of order.
+    BadRequest,
+    /// The buffer is not in cart RAM.
+    BadBuffer,
+    /// The name breaks the rules (see file_max_name).
+    BadName,
+    /// A computer has the USB drive mounted: unplug it and try again.
+    UsbHost,
+    /// Another request is in flight.
+    Busy,
+    /// That volume is not mounted.
+    NoVolume,
+    /// write/commit/abort with no open file.
+    NotOpen,
+    /// Flash read-back did not match.
+    IoError,
+};
+
+/// Whether the OS lets carts create files (no probe: an os_flags bit).
+pub fn cart_files() bool {
+    return platform.cart_files();
+}
+
+/// Flags from the OS's last file reply: `usb_host` (a computer has the drive
+/// now) and `ext_volume` (SYCLEXTRA is mounted). file_probe() refreshes them.
+pub fn file_flags() FileFlags {
+    return platform.file_flags();
+}
+
+/// `buf` is mutable even for writes: the OS writes through it for stat, and a
+/// const pointer would let the optimizer assume it doesn't.
+fn file_call(op: os_abi.FileOp, volume: u32, offset: u32, buf: ?[*]u8, len: usize) FileError!u32 {
+    if (!cart_files()) return error.Unsupported;
+    if (len > std.math.maxInt(u32)) return error.BadRequest;
+    var result: u32 = 0;
+    return switch (platform.file_transact(op, volume, offset, buf, @intCast(len), &result)) {
+        .ok => result,
+        .exists => error.Exists,
+        .no_space => error.NoSpace,
+        .dir_full => error.DirFull,
+        .bad_request => error.BadRequest,
+        .bad_buffer => error.BadBuffer,
+        .bad_name => error.BadName,
+        .usb_host => error.UsbHost,
+        .busy => error.Busy,
+        .no_volume => error.NoVolume,
+        .not_open => error.NotOpen,
+        else => error.IoError,
+    };
+}
+
+/// The OS's cart-files ABI version (1); refreshes file_flags().
+pub fn file_probe() FileError!u32 {
+    return try file_call(.probe, 0, 0, null, 0);
+}
+
+/// Free space and root directory entries of a volume (an open file's
+/// reservation counts as used).
+pub fn file_stat(volume: u8) FileError!FileStat {
+    var st: FileStat align(4) = undefined;
+    _ = try file_call(.stat, volume, 0, @ptrCast(&st), @sizeOf(FileStat));
+    return st;
+}
+
+/// Reserve `size` bytes for a new file `name` on `volume` and open it. Nothing
+/// on the drive changes until file_commit().
+pub fn file_create(volume: u8, name: []const u8, size: u32) FileError!void {
+    if (name.len == 0 or name.len > file_max_name) return error.BadName;
+    _ = try file_call(.create, volume, size, @constCast(name.ptr), name.len);
+}
+
+/// Write `data` at byte `offset` of the open file; offset must equal the
+/// bytes written so far. Any length: sent in file_max_write pieces.
+pub fn file_write(offset: u32, data: []const u8) FileError!void {
+    var done: usize = 0;
+    while (done < data.len) {
+        const n = @min(data.len - done, file_max_write);
+        const at = std.math.add(u32, offset, @intCast(done)) catch return error.BadRequest;
+        _ = try file_call(.write, 0, at, @constCast(data.ptr + done), n);
+        done += n;
+    }
+}
+
+/// All bytes written: link the file into the drive's FAT and directory.
+pub fn file_commit() FileError!void {
+    _ = try file_call(.commit, 0, 0, null, 0);
+}
+
+/// Drop the open file; the drive is left as it was.
+pub fn file_abort() FileError!void {
+    _ = try file_call(.abort, 0, 0, null, 0);
+}
+
+// ┌───────────────────────────────────────────────────────────────────────────┐
+// │                                                                           │
 // │ Profiling Functions                                                       │
 // │                                                                           │
 // └───────────────────────────────────────────────────────────────────────────┘

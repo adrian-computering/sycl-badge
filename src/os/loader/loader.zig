@@ -58,7 +58,7 @@ var cart_state: terry.core0.TrackedStateMachine(CartState) = undefined;
 var cart_entry_point: mailbox.MessageType.CartExecute = undefined;
 
 /// Loaded cart info
-var loaded_cart_name: [11:0]u8 = undefined;
+var loaded_cart_name: [12:0]u8 = undefined;
 var loaded_cart_size: u32 = 0;
 
 pub fn getCartRamStart() u32 {

@@ -5,10 +5,17 @@ const ext_flash = @import("../drivers/ext_flash.zig");
 const flash_ops = @import("../drivers/flash_ops.zig");
 const beam_slot = @import("beam_slot.zig");
 const fat = @import("../drivers/fat.zig");
+const fat_names = @import("fat_names.zig");
 const log = std.log.scoped(.storage);
 
 const microzig = @import("microzig");
 const interrupt = microzig.interrupt;
+
+/// Host unit tests (`zig build test`, fork/CART_FILES.md) run this file over
+/// RAM images instead of the XIP window and the bootrom (see `host`).
+const is_host = @import("builtin").os.tag != .freestanding;
+/// `.ram_text` on the badge; Mach-O hosts reject that section name.
+const ram_text = if (!is_host) ".ram_text" else if (@import("builtin").object_format == .macho) "__TEXT,__text" else ".text";
 
 extern const __romfs_start__: u8;
 extern const __romfs_end__: u8;
@@ -78,7 +85,7 @@ pub const CartInfo = struct {
     volume: u8 = 0,
     start_cluster: u16,
     size: u32,
-    short_name: [11:0]u8, // "NAME.EXT" + NUL (fallback)
+    short_name: [12:0]u8, // "NAME.EXT" + NUL (fallback)
     long_name: [256]u8, // Long file name buffer
     long_name_len: usize, // Act len of long name
 
@@ -322,7 +329,7 @@ fn fatSectors(v: *const Volume) u16 {
         // FAT12 uses 12-bit entries (1.5 bytes per cluster)
         const needed = ((clusters * 3 + 1) / 2 + (SECTOR_SIZE - 1)) / SECTOR_SIZE;
         if (needed == fat_secs) break;
-        fat_secs = needed;
+        fat_secs = @intCast(needed);
     }
     return @intCast(fat_secs);
 }
@@ -464,17 +471,17 @@ pub fn readSector(v: *const Volume, lba: u32, dst: []u8) void {
         @memcpy(dst[0..SECTOR_SIZE], pending_buf[block_offset .. block_offset + SECTOR_SIZE]);
         return;
     }
-    const base_ptr: [*]const u8 = @ptrFromInt(v.base);
+    const base_ptr = flashPtr(v.base);
     const offset = @as(usize, lba) * SECTOR_SIZE;
     @memcpy(dst[0..SECTOR_SIZE], base_ptr[offset .. offset + SECTOR_SIZE]);
 }
 
-pub fn writeSector(v: *const Volume, lba: u32, src: *const [SECTOR_SIZE]u8) linksection(".ram_text") void {
+pub fn writeSector(v: *const Volume, lba: u32, src: *const [SECTOR_SIZE]u8) linksection(ram_text) void {
     if (lba >= totalSectors(v)) {
         return;
     }
 
-    const addr = v.base + lba * SECTOR_SIZE;
+    const addr: u32 = @intCast(v.base + lba * SECTOR_SIZE);
     const block_addr = addr & ~@as(u32, FLASH_ERASE_BLOCK - 1);
     const block_offset = addr - block_addr;
 
@@ -484,7 +491,7 @@ pub fn writeSector(v: *const Volume, lba: u32, src: *const [SECTOR_SIZE]u8) link
         if (pending_valid and pending_dirty and pending_block_addr != block_addr) {
             flushPending();
         }
-        const block_ptr: [*]const u8 = @ptrFromInt(block_addr);
+        const block_ptr = flashPtr(block_addr);
         @memcpy(pending_buf[0..FLASH_ERASE_BLOCK], block_ptr[0..FLASH_ERASE_BLOCK]);
         pending_block_addr = block_addr;
         pending_valid = true;
@@ -494,7 +501,7 @@ pub fn writeSector(v: *const Volume, lba: u32, src: *const [SECTOR_SIZE]u8) link
     pending_dirty = true;
 }
 
-pub fn flushPendingWrites() linksection(".ram_text") void {
+pub fn flushPendingWrites() linksection(ram_text) void {
     flushPending();
 }
 
@@ -510,7 +517,7 @@ pub fn romfsSizeBytes() usize {
     return volumes[0].size;
 }
 
-fn flushPending() linksection(".ram_text") void {
+fn flushPending() linksection(ram_text) void {
     if (!pending_valid) {
         return; // Silent (no pending data)
     }
@@ -521,10 +528,96 @@ fn flushPending() linksection(".ram_text") void {
     const flash_offset = pending_block_addr - XIP_BASE;
     log.debug("flushPending: flash_offset=0x{x}, size={d}", .{ flash_offset, FLASH_ERASE_BLOCK });
 
-    // Critical section, XIP off, QMI window 0 restored afterwards.
-    flash_ops.eraseAndProgram(flash_offset, FLASH_ERASE_BLOCK, pending_buf[0..FLASH_ERASE_BLOCK]);
+    if (is_host) {
+        host.program(pending_block_addr, &pending_buf);
+    } else {
+        // Critical section, XIP off, QMI window 0 restored afterwards.
+        flash_ops.eraseAndProgram(flash_offset, FLASH_ERASE_BLOCK, pending_buf[0..FLASH_ERASE_BLOCK]);
+    }
     pending_dirty = false;
 }
+
+/// Flash bytes at a volume address: the XIP window on the badge, a RAM image
+/// in host tests.
+fn flashPtr(addr: u32) [*]const u8 {
+    if (is_host) return host.ptr(addr);
+    return @ptrFromInt(addr);
+}
+
+/// Host test backend: volumes over RAM images, a 4 KB block "program" copies
+/// the pending block into the image. `flush_budget` simulates a power cut:
+/// once it reaches 0, flushes are dropped (the image keeps what it had).
+pub const host = if (is_host) struct {
+    pub const Geometry = enum { romfs, ext };
+    /// Badge-like addresses, so block math matches the badge.
+    const bases = [2]u32{ 0x10080000, 0x11000000 };
+    var images: [2][]u8 = .{ &.{}, &.{} };
+    pub var flush_count: u32 = 0;
+    pub var flush_budget: ?u32 = null;
+
+    /// Mount images as the badge's volumes (index 0 = SYCLBADGE geometry,
+    /// 1 = SYCLEXTRA). image.len must be the volume size (volumeSize()).
+    /// Drops any pending write; formats the images when `format` is set.
+    pub fn mount(imgs: []const []u8, format: bool) void {
+        pending_valid = false;
+        pending_dirty = false;
+        flush_count = 0;
+        flush_budget = null;
+        volume_count = @intCast(imgs.len);
+        for (imgs, 0..) |img, i| {
+            const geo: Geometry = @fromBackingInt(@intCast(i));
+            std.debug.assert(img.len == volumeSize(geo));
+            images[i] = img;
+            volumes[i] = .{
+                .base = bases[i],
+                .size = volumeSize(geo),
+                .root_entries = if (geo == .romfs) ROMFS_ROOT_ENTRIES else EXT_ROOT_ENTRIES,
+                .label = if (geo == .romfs) "SYCLBADGE  " else "SYCLEXTRA  ",
+                .serial = if (geo == .romfs) 0x20260120 else 0x20261005,
+            };
+            if (format) {
+                @memset(img, 0xFF);
+                formatVolume(&volumes[i]);
+            }
+        }
+    }
+
+    /// findCart on one volume (the received-cart slot needs the badge).
+    pub fn find(index: u8, name: []const u8) ?CartInfo {
+        return findCartIn(&volumes[index], index, name);
+    }
+
+    pub fn volumeSize(geo: Geometry) u32 {
+        return switch (geo) {
+            .romfs => 1280 * 1024, // LENGTH(romfs) in src/os/linker.ld
+            .ext => EXT_VOLUME_SIZE,
+        };
+    }
+
+    fn ptr(addr: u32) [*]u8 {
+        for (volumes[0..volume_count], 0..) |v, i| {
+            if (addr >= v.base and addr - v.base < v.size) return images[i].ptr + (addr - v.base);
+        }
+        @panic("host storage: address outside every volume");
+    }
+
+    fn program(block_addr: u32, block: *const [FLASH_ERASE_BLOCK]u8) void {
+        if (flush_budget) |*b| {
+            if (b.* == 0) return;
+            b.* -= 1;
+        }
+        flush_count += 1;
+        const p = ptr(block_addr);
+        // The last block of a volume may be partial.
+        for (volumes[0..volume_count]) |v| {
+            if (block_addr >= v.base and block_addr - v.base < v.size) {
+                const n = @min(FLASH_ERASE_BLOCK, v.base + v.size - block_addr);
+                @memcpy(p[0..n], block[0..n]);
+                return;
+            }
+        }
+    }
+} else struct {};
 
 /// Visit every cart on every volume (main volume first), then the
 /// received-cart slot if it holds a valid cart.
@@ -561,7 +654,7 @@ fn listCartsIn(v: *const Volume, index: u8, callback: *const fn (name: []const u
     const root_secs = rootDirSectors(v);
     var lba: u32 = root_start;
     var remaining: u16 = root_secs;
-    var name_buf: [11:0]u8 = undefined;
+    var name_buf: [12:0]u8 = undefined;
     var lfn_buf: [256]u8 = undefined;
     var has_prev_sector = false;
 
@@ -623,7 +716,7 @@ fn countCartsIn(v: *const Volume, index: u8, first_cart: ?*CartInfo) u32 {
     const root_secs = rootDirSectors(v);
     var lba: u32 = root_start;
     var remaining: u16 = root_secs;
-    var name_buf: [12]u8 = undefined;
+    var name_buf: [12:0]u8 = undefined;
     var lfn_buf: [256]u8 = undefined;
     var has_prev_sector = false;
     var count: u32 = 0;
@@ -700,7 +793,7 @@ fn findCartIn(v: *const Volume, index: u8, name: []const u8) ?CartInfo {
     const root_secs = rootDirSectors(v);
     var lba: u32 = root_start;
     var remaining: u16 = root_secs;
-    var name_buf: [11:0]u8 = undefined;
+    var name_buf: [12:0]u8 = undefined;
     var lfn_buf: [256]u8 = undefined;
     var has_prev_sector = false;
     var sector_buf = &sector_bufs[0];
@@ -783,7 +876,7 @@ fn deleteCartIn(v: *const Volume, name: []const u8) bool {
     const root_secs = rootDirSectors(v);
     var lba: u32 = root_start;
     var remaining: u16 = root_secs;
-    var name_buf: [11:0]u8 = undefined;
+    var name_buf: [12:0]u8 = undefined;
     var lfn_buf: [256]u8 = undefined;
     var has_prev_sector = false;
     var prev_sector_buf = &sector_bufs[0];
@@ -954,7 +1047,7 @@ fn clusterToLba(v: *const Volume, cluster: u16) u32 {
 fn fatEntry(v: *const Volume, cluster: u16, sector_buf: *[SECTOR_SIZE]u8, next_buf: *[SECTOR_SIZE]u8) u16 {
     const fat_start = VOLUME_START_LBA + RESERVED_SECTORS;
     const offset = @as(u32, cluster) + (@as(u32, cluster) / 2);
-    const lba = fat_start + (offset / SECTOR_SIZE);
+    const lba: u32 = @intCast(fat_start + (offset / SECTOR_SIZE));
     const index = @as(usize, offset % SECTOR_SIZE);
     readSector(v, lba, sector_buf[0..]);
     const b0: u8 = sector_buf[index];
@@ -975,7 +1068,7 @@ fn fatEntry(v: *const Volume, cluster: u16, sector_buf: *[SECTOR_SIZE]u8, next_b
 fn setFatEntry(v: *const Volume, cluster: u16, value: u16, sector_buf: *[SECTOR_SIZE]u8, next_buf: *[SECTOR_SIZE]u8) void {
     const fat_start = VOLUME_START_LBA + RESERVED_SECTORS;
     const offset = @as(u32, cluster) + (@as(u32, cluster) / 2);
-    const base_lba = fat_start + (offset / SECTOR_SIZE);
+    const base_lba: u32 = @intCast(fat_start + (offset / SECTOR_SIZE));
     const index = @as(usize, offset % SECTOR_SIZE);
     var fat_index: u8 = 0;
     const val = value & 0x0FFF;
@@ -1102,138 +1195,11 @@ fn writeU32(buf: []u8, offset: usize, value: u32) void {
     buf[offset + 3] = @truncate(value >> 24);
 }
 
-/// Get Unicode chars from LFN entry (little UTF-16)
-fn getLfnChar(entry: []const u8, offset: usize) u16 {
-    return @as(u16, entry[offset]) | (@as(u16, entry[offset + 1]) << 8);
-}
-
-/// Calc checksum for SFN
-fn sfnChecksum(sfn: []const u8) u8 {
-    var sum: u8 = 0;
-    for (0..11) |i| {
-        sum = ((sum & 1) << 7) +% (sum >> 1) +% sfn[i];
-    }
-    return sum;
-}
-
-/// Read LFN entries that span across two sectors
-/// prev_sector: prev sector buffer (null if first sector)
-/// curr_sector: curr sector buffer
-/// start_idx: SFN entry idx in curr sector
-/// out: output buffer for reconstructed flname
-fn readLfnEntriesMultiSector(prev_sector: ?*const [SECTOR_SIZE]u8, curr_sector: []const u8, start_idx: usize, out: []u8) usize {
-    // SFN entry to get checksum from
-    const sfn_entry = curr_sector[start_idx .. start_idx + DIR_ENTRY_SIZE];
-    const expected_checksum = sfnChecksum(sfn_entry[DIR_NAME .. DIR_NAME + 11]);
-
-    var lfn_chars: [256]u16 = undefined;
-    var total_chars: usize = 0;
-    var found_first = false;
-
-    // Scan backwards in curr sector
-    if (start_idx > 0) {
-        var pos: isize = @as(isize, @intCast(start_idx)) - @as(isize, DIR_ENTRY_SIZE);
-        while (pos >= 0) : (pos -= DIR_ENTRY_SIZE) {
-            const idx: usize = @intCast(pos);
-            const entry = curr_sector[idx .. idx + DIR_ENTRY_SIZE];
-
-            // Stop if not an LFN entry
-            if (entry[DIR_ATTR] != 0x0F) break;
-            if (entry[0] == 0xE5) break; // Deleted
-
-            // Check checksum matches
-            if (entry[13] != expected_checksum) break;
-
-            // Extract chars from this entry (13 chars per LFN entry)
-            // Chars 1-5: bytes 1-10
-            for (0..5) |i| {
-                const c = getLfnChar(entry, 1 + i * 2);
-                if (c != 0 and c != 0xFFFF and total_chars < lfn_chars.len) {
-                    lfn_chars[total_chars] = c;
-                    total_chars += 1;
-                } else if (c == 0) break;
-            }
-            // Chars 6-11: bytes 14-25
-            for (0..6) |i| {
-                const c = getLfnChar(entry, 14 + i * 2);
-                if (c != 0 and c != 0xFFFF and total_chars < lfn_chars.len) {
-                    lfn_chars[total_chars] = c;
-                    total_chars += 1;
-                } else if (c == 0) break;
-            }
-            // Chars 12-13: bytes 28-31
-            for (0..2) |i| {
-                const c = getLfnChar(entry, 28 + i * 2);
-                if (c != 0 and c != 0xFFFF and total_chars < lfn_chars.len) {
-                    lfn_chars[total_chars] = c;
-                    total_chars += 1;
-                } else if (c == 0) break;
-            }
-
-            // Check if first (last in seq) entry
-            const seq = entry[0];
-            if ((seq & 0x40) != 0) {
-                found_first = true;
-                break;
-            }
-        }
-    }
-
-    if (!found_first and prev_sector != null and (start_idx == 0 or total_chars > 0)) {
-        var pos: isize = SECTOR_SIZE - DIR_ENTRY_SIZE;
-        while (pos >= 0) : (pos -= DIR_ENTRY_SIZE) {
-            const idx: usize = @intCast(pos);
-            const entry = prev_sector.?[idx .. idx + DIR_ENTRY_SIZE];
-
-            if (entry[DIR_ATTR] != 0x0F) break;
-            if (entry[0] == 0xE5) break;
-            if (entry[13] != expected_checksum) break;
-
-            // Extract chars
-            for (0..5) |i| {
-                const c = getLfnChar(entry, 1 + i * 2);
-                if (c != 0 and c != 0xFFFF and total_chars < lfn_chars.len) {
-                    lfn_chars[total_chars] = c;
-                    total_chars += 1;
-                } else if (c == 0) break;
-            }
-            for (0..6) |i| {
-                const c = getLfnChar(entry, 14 + i * 2);
-                if (c != 0 and c != 0xFFFF and total_chars < lfn_chars.len) {
-                    lfn_chars[total_chars] = c;
-                    total_chars += 1;
-                } else if (c == 0) break;
-            }
-            for (0..2) |i| {
-                const c = getLfnChar(entry, 28 + i * 2);
-                if (c != 0 and c != 0xFFFF and total_chars < lfn_chars.len) {
-                    lfn_chars[total_chars] = c;
-                    total_chars += 1;
-                } else if (c == 0) break;
-            }
-
-            if ((entry[0] & 0x40) != 0) {
-                found_first = true;
-                break;
-            }
-        }
-    }
-
-    // If found complete LFN chain, convert to ASCII
-    if (found_first and total_chars > 0) {
-        var out_idx: usize = 0;
-        for (0..total_chars) |i| {
-            const c = lfn_chars[i];
-            if (c < 0x80 and out_idx < out.len) {
-                out[out_idx] = @truncate(c);
-                out_idx += 1;
-            }
-        }
-        return out_idx;
-    }
-
-    return 0;
-}
+// Name matching lives in fat_names.zig, shared with fat_write.zig (cart files),
+// so the menu, the console and cart-created files agree on names.
+const getLfnChar = fat_names.getLfnChar;
+const sfnChecksum = fat_names.sfnChecksum;
+const readLfnEntriesMultiSector = fat_names.readLfnEntriesMultiSector;
 
 /// Extract one LFN data
 fn extractLfnEntry(entry: []const u8, chars_out: *[13]u16, expected_seq: *u8) bool {
@@ -1380,54 +1346,5 @@ fn readLfnEntries(sector_buf: []const u8, start_idx: usize, out: []u8) usize {
     return out_idx;
 }
 
-fn formatShortName(entry: []const u8, buf: *[11:0]u8) []const u8 {
-    var idx: usize = 0;
-    while (idx < 8 and entry[DIR_NAME + idx] != ' ') : (idx += 1) {
-        buf[idx] = entry[DIR_NAME + idx];
-    }
-    if (entry[DIR_EXT] != ' ') {
-        buf[idx] = '.';
-        idx += 1;
-        var j: usize = 0;
-        while (j < 3 and entry[DIR_EXT + j] != ' ') : (j += 1) {
-            buf[idx] = entry[DIR_EXT + j];
-            idx += 1;
-        }
-    }
-    buf[idx] = 0;
-    return buf[0..idx];
-}
-
-fn normalizeName(name: []const u8, out: *[12]u8) usize {
-    var i: usize = 0;
-    var dot: ?usize = null;
-    while (i < name.len) : (i += 1) {
-        if (name[i] == '.') {
-            dot = i;
-            break;
-        }
-    }
-    var out_idx: usize = 0;
-    const base_end = dot orelse name.len;
-    var bi: usize = 0;
-    while (bi < base_end and out_idx < 8) : (bi += 1) {
-        const ch = name[bi];
-        out[out_idx] = std.ascii.toUpper(ch);
-        out_idx += 1;
-    }
-    if (dot != null) {
-        out[out_idx] = '.';
-        out_idx += 1;
-        var ei: usize = dot.? + 1;
-        var ext_len: usize = 0;
-        while (ei < name.len and ext_len < 3) : ({
-            ei += 1;
-            ext_len += 1;
-        }) {
-            out[out_idx] = std.ascii.toUpper(name[ei]);
-            out_idx += 1;
-        }
-    }
-    out[out_idx] = 0;
-    return out_idx;
-}
+const formatShortName = fat_names.formatShortName;
+const normalizeName = fat_names.normalizeName;

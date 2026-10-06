@@ -101,8 +101,10 @@ pub fn crc32(bytes: []const u8) u32 {
 }
 
 /// Parse and check a slot header: the "valid slot" rule, which is all the
-/// menu checks. `area_size` is the size of the cart-writable area.
-pub fn parseHeader(bytes: *const [header_size]u8, area_size: u32, ram: Region) HeaderError!Header {
+/// menu checks. `area_size` is the size of the cart-writable area; `image`
+/// is where an image may lie: cart RAM above the IPC block, so a slot can
+/// never write into the block the OS shares with the cart.
+pub fn parseHeader(bytes: *const [header_size]u8, area_size: u32, image: Region) HeaderError!Header {
     if (readU32(bytes, off_magic) != magic) return error.BadMagic;
     if (readU16(bytes, off_version) != format_version) return error.BadVersion;
     if (readU16(bytes, off_header_size) != header_size) return error.BadHeaderSize;
@@ -125,7 +127,7 @@ pub fn parseHeader(bytes: *const [header_size]u8, area_size: u32, ram: Region) H
     if (area_size < image_offset or h.image_len > area_size - image_offset) return error.ImageTooLong;
 
     const image_end = @as(u64, h.load_addr) + h.image_len;
-    if (h.load_addr < ram.start or image_end > ram.end) return error.OutsideCartRam;
+    if (h.load_addr < image.start or image_end > image.end) return error.OutsideCartRam;
 
     if (h.descriptor_offset % 4 != 0 or
         @as(u64, h.descriptor_offset) + descriptor_v1_size > h.image_len)
@@ -145,10 +147,18 @@ pub const LoadError = error{ FileNotFound, ReadError, AddressMismatch, VersionMi
 /// is cart RAM itself; host tests pass a buffer standing in for it.
 pub const Memory = struct {
     ram: Region,
+    /// End of the IPC block at the start of cart RAM: the lowest address an
+    /// image may start at (the descriptor checks still use `ram`, as the UF2
+    /// loader does).
+    ipc_end: u32,
     /// cart_xip region: a v1 entry point may also lie there.
     xip: Region,
     /// Bytes of [ram.start, ram.end).
     bytes: []u8,
+
+    pub fn imageRegion(mem: Memory) Region {
+        return .{ .start = mem.ipc_end, .end = mem.ram.end };
+    }
 };
 
 /// Offset in a UF2 payload of the first CART_MAGIC word, 4-aligned: how the
@@ -182,7 +192,7 @@ pub fn checkDescriptorV1(bss_start: u32, bss_end: u32, entry_point: u32, ram: Re
 /// cart). Nothing may run the image if this fails.
 pub fn loadInto(slot: []const u8, mem: Memory) LoadError!u32 {
     if (slot.len < image_offset) return error.FileNotFound;
-    const h = parseHeader(slot[0..header_size], @intCast(@min(slot.len, std.math.maxInt(u32))), mem.ram) catch
+    const h = parseHeader(slot[0..header_size], @intCast(@min(slot.len, std.math.maxInt(u32))), mem.imageRegion()) catch
         return error.FileNotFound;
 
     const image = slot[image_offset..][0..h.image_len];
@@ -224,11 +234,16 @@ fn badgeRam() Region {
     return .{ .start = loader.getCartRamStart(), .end = loader.getCartRamEnd() };
 }
 
+/// End of the cart IPC block (0x20035100), the lowest address an image may use.
+fn badgeIpcEnd() u32 {
+    return @intFromPtr(abi.ipc_data) + @sizeOf(abi.CartIPCData);
+}
+
 /// The slot's header if the slot is valid (cheap: header checks only).
 pub fn validHeader() ?Header {
     const area = slotArea() orelse return null;
     if (area.len < image_offset) return null;
-    return parseHeader(area[0..header_size], @intCast(area.len), badgeRam()) catch null;
+    return parseHeader(area[0..header_size], @intCast(area.len), .{ .start = badgeIpcEnd(), .end = badgeRam().end }) catch null;
 }
 
 /// Load the slot into cart RAM (core 1 must be stopped). Same result as the
@@ -239,6 +254,7 @@ pub fn loadSlot() LoadError!@import("../ipc/mailbox.zig").MessageType.CartExecut
     const ram = badgeRam();
     const offset = try loadInto(area, .{
         .ram = ram,
+        .ipc_end = badgeIpcEnd(),
         .xip = .{ .start = loader.getCartXipStart(), .end = loader.getCartXipEnd() },
         .bytes = @as([*]u8, @ptrFromInt(ram.start))[0 .. ram.end - ram.start],
     });

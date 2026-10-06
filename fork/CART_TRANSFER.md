@@ -52,18 +52,25 @@ Header, 96 bytes at offset 0:
 | 84 | [8]u8 | reserved, 0 |
 | 92 | u32 | `header_crc32` over bytes 0..92 |
 
-**The image** is the flattened UF2. UF2 payloads are placed at
-`target_addr - load_addr`, gaps between payloads are zero, and
-`load_addr` is the lowest target address. Every target must lie in cart
-RAM. A UF2 with any block in the XIP range is not transferable. The
-descriptor is the first `CART_MAGIC` word found the way the UF2 loader
-finds it: in block order, within each block's payload, 4-aligned.
+**The image** is the flattened UF2. Every target must lie in cart RAM
+(`[__process_ram_start__, __process_ram_end__]`). First, every block whose
+whole target range lies below the **IPC block end** (`0x20020000 +
+@sizeOf(CartIPCData)` = `0x20035100`) is dropped: these are the ELF and
+program headers that the first `LOAD` segment of a monorepo RAM cart
+carries (see "Decided" below), and the OS clears the IPC block at cart
+start anyway. A block that straddles the IPC block end makes the UF2 not
+transferable, as does any block in the XIP range. The kept payloads are
+placed at `target_addr - load_addr`, gaps between payloads are zero, and
+`load_addr` is the lowest kept target address. The descriptor is the
+first `CART_MAGIC` word found the way the UF2 loader finds it: in block
+order, within each kept block's payload, 4-aligned.
 
 **Valid slot**: magic, version, header_size and header_crc32 all match;
 `load_addr` and `load_addr + image_len` lie within
-`[__process_ram_start__, __process_ram_end__]`, the same rule the UF2
-loader applies to each block; `image_len` fits the area; the descriptor
-lies inside the image. The menu checks only this.
+`[IPC block end, __process_ram_end__]`, so a slot never writes into the
+IPC block (stricter than the UF2 loader's per-block rule, which starts at
+`__process_ram_start__`); `image_len` fits the area; the descriptor lies
+inside the image. The menu checks only this.
 **Launchable** additionally requires that `image_crc32` matches and that
 the descriptor passes the UF2 loader's v1 checks (magic, version, BSS and
 entry bounds, thumb bit).
@@ -134,11 +141,13 @@ that looks valid but isn't):
   bootrom's `flash_flush_cache`, which invalidates the whole XIP cache
   (shared by both windows and both cores), so neither the cart's
   read-back nor the OS sees stale lines.
-- Bounds: the image may cover exactly what a UF2 RAM cart may, i.e.
-  `[__process_ram_start__, __process_ram_end__)` (0x20020000-0x20080000).
-  Process RAM holds nothing the OS uses while loading a RAM cart (the UF2
-  loader's flash buffer there is only used for XIP carts), and the IPC
-  block at its start is rewritten at cart start.
+- Bounds: the image may cover `[IPC block end, __process_ram_end__)`
+  (0x20035100-0x20080000). The OS takes the IPC block end from the real
+  `ipc_data` address plus `@sizeOf(CartIPCData)`, not a constant. The
+  descriptor checks (BSS, entry point) keep the UF2 loader's bounds,
+  `[__process_ram_start__, __process_ram_end__)`. Above the IPC block,
+  process RAM holds nothing the OS uses while loading a RAM cart (the UF2
+  loader's flash buffer there is only used for XIP carts).
 - No new IPC words or mailbox messages.
 
 ### Cart ABI
@@ -156,10 +165,14 @@ with the free range becoming `6-15`.
 - Host tests (`zig build test`, `src/os/tests/beam_slot_test.zig`):
   golden header bytes built from the table above, every validity rule
   (each field broken in turn), a CRC mismatch is refused at launch, the
-  v1 descriptor checks, and slot-vs-UF2 loads compared byte for byte in a
-  RAM buffer (the UF2 side runs the loader's RAM-cart path: same parser,
-  bounds, descriptor search and checks). Cases: a synthetic cart with a
-  gap; `src/os/tests/fixtures/snouty-pong.uf2` flattened by the test's
+  v1 descriptor checks, a slot whose image starts inside the IPC block
+  is refused and writes nothing, and slot-vs-UF2 loads compared byte for
+  byte in a RAM buffer over `[IPC block end, process RAM end)` (the UF2
+  side runs the loader's RAM-cart path: same parser, bounds, descriptor
+  search and checks; below the IPC end it also writes the dropped
+  header blocks, and the slot side must have written nothing there).
+  Cases: a synthetic cart with a dropped header block and a gap (plus a
+  straddling block refused by the flattener); `src/os/tests/fixtures/snouty-pong.uf2` flattened by the test's
   own copy of the flattening rule; and, when present,
   `src/os/tests/fixtures/beam_slot_pong.bin` (header sector + image, as
   the monorepo's flattener writes it from that same `snouty-pong.uf2`):
@@ -169,19 +182,21 @@ with the free range becoming `6-15`.
 - Build: `zig build -Dsimulator=false`, and the full build including the
   simulator.
 
-## Open: ELF headers in RAM cart UF2s
+## Decided: ELF headers in RAM cart UF2s are dropped
 
 Carts built by the monorepo (checked: `snouty-pong.uf2`) carry two UF2
 blocks at `0x20030000` holding the ELF and program headers (the first
 `LOAD` segment includes them), inside the IPC block (`0x20020000` up to
 `0x20035100`). The UF2 loader copies them there and the OS clears the IPC
-block at cart start. Under format v1 they set `load_addr = 0x20030000`, so
-every image carries a ~20 KB zero gap before the cart at `0x20035100`
-(pong: 44544-byte image for ~23 KB of cart), and the largest transferable
-cart shrinks from 252 KB to about 232 KB. Loading is still correct and
-byte-identical to the UF2 path. Possible fixes, both outside format v1's
-current text: the flattener skips blocks below `0x20035100` (they never
-reach a running cart), or the cart link stops loading the headers.
+block at cart start, so they never reach a running cart. Kept in the
+image, they would set `load_addr = 0x20030000` and pad every image with a
+~20 KB zero gap (pong: 44544 bytes instead of 23808), cutting the largest
+transferable cart from 252 KB to about 232 KB.
+
+Decision (format still v1, nothing had shipped): the flattener drops every
+block wholly below the IPC block end, a straddling block makes the UF2 not
+transferable, and the OS refuses a slot whose `load_addr` is below the
+IPC block end (see "The image" and "Valid slot" above).
 
 ## Hardware check
 

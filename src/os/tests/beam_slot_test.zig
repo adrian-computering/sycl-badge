@@ -20,6 +20,11 @@ const CART_VERSION_V1: u32 = 0x54C126_01;
 // The badge's memory map (src/os/linker.ld).
 const ram: beam_slot.Region = .{ .start = 0x20020000, .end = 0x20080000 };
 const xip: beam_slot.Region = .{ .start = 0x101C0000, .end = 0x10200000 };
+/// 0x20020000 + @sizeOf(CartIPCData) on the badge (os_abi.zig asserts the
+/// size; the host can't take it, CartIPCData holds a pointer). A slot image
+/// may start no lower.
+const ipc_end: u32 = 0x20035100;
+const image_region: beam_slot.Region = .{ .start = ipc_end, .end = ram.end };
 const area_size: u32 = 256 * 1024;
 
 const Fields = struct {
@@ -56,7 +61,7 @@ fn makeHeader(f: Fields) [96]u8 {
 }
 
 fn parse(h: [96]u8) beam_slot.HeaderError!beam_slot.Header {
-    return beam_slot.parseHeader(&h, area_size, ram);
+    return beam_slot.parseHeader(&h, area_size, image_region);
 }
 
 test "crc32 is zlib's" {
@@ -124,10 +129,14 @@ test "each validity rule refuses its broken field" {
     try testing.expectError(E.BadName, parse(makeHeader(.{ .name = "a\x7Fb" })));
 
     // image_len at most area size - 4096.
-    _ = try parse(makeHeader(.{ .load_addr = ram.start, .image_len = area_size - 4096 }));
-    try testing.expectError(E.ImageTooLong, parse(makeHeader(.{ .load_addr = ram.start, .image_len = area_size - 4095 })));
+    _ = try parse(makeHeader(.{ .load_addr = ipc_end, .image_len = area_size - 4096 }));
+    try testing.expectError(E.ImageTooLong, parse(makeHeader(.{ .load_addr = ipc_end, .image_len = area_size - 4095 })));
 
-    // load_addr and load_addr + image_len inside cart RAM.
+    // load_addr and load_addr + image_len inside cart RAM above the IPC block.
+    _ = try parse(makeHeader(.{ .load_addr = ipc_end }));
+    try testing.expectError(E.OutsideCartRam, parse(makeHeader(.{ .load_addr = ipc_end - 4 })));
+    try testing.expectError(E.OutsideCartRam, parse(makeHeader(.{ .load_addr = 0x20030000 })));
+    try testing.expectError(E.OutsideCartRam, parse(makeHeader(.{ .load_addr = ram.start })));
     try testing.expectError(E.OutsideCartRam, parse(makeHeader(.{ .load_addr = ram.start - 4 })));
     try testing.expectError(E.OutsideCartRam, parse(makeHeader(.{ .load_addr = 0x101C0000 })));
     _ = try parse(makeHeader(.{ .load_addr = ram.end - 0x1000, .image_len = 0x1000 }));
@@ -161,7 +170,7 @@ const TestRam = struct {
     }
 
     fn memory(t: TestRam) beam_slot.Memory {
-        return .{ .ram = ram, .xip = xip, .bytes = t.bytes };
+        return .{ .ram = ram, .ipc_end = ipc_end, .xip = xip, .bytes = t.bytes };
     }
 
     fn at(t: TestRam, addr: u32, len: usize) []u8 {
@@ -265,6 +274,15 @@ test "load refuses an invalid header as not found" {
     for (t.bytes) |b| try testing.expectEqual(fill_pattern, b);
 }
 
+test "load refuses a slot whose image starts inside the IPC block" {
+    const t = try TestRam.init(fill_pattern);
+    defer t.deinit();
+    const c: Cart = .{ .load_addr = 0x20030000, .bss_start = 0x20035100, .bss_end = 0x20035200, .entry = 0x20030101 };
+    try testing.expectError(error.FileNotFound, loadCart(c, t));
+    try testing.expectError(error.FileNotFound, loadCart(.{ .load_addr = ipc_end - 0x100 }, t));
+    for (t.bytes) |b| try testing.expectEqual(fill_pattern, b);
+}
+
 test "load applies the UF2 loader's v1 descriptor checks" {
     const t = try TestRam.init(fill_pattern);
     defer t.deinit();
@@ -365,6 +383,8 @@ fn flatten(file: []const u8) !Flat {
         const payload = blk.getPayload();
         const target = blk.header.target_addr;
         if (target < ram.start or target + payload.len > ram.end) return error.NotTransferable;
+        if (target + payload.len <= ipc_end) continue; // ELF headers: dropped
+        if (target < ipc_end) return error.NotTransferable; // straddles the IPC end
         lo = @min(lo, target);
         hi = @max(hi, target + @as(u32, @intCast(payload.len)));
         if (descriptor == null) {
@@ -376,12 +396,15 @@ fn flatten(file: []const u8) !Flat {
     for (0..file.len / 512) |i| {
         const blk = try parser.parseBlock(block(file, i, &scratch));
         const payload = blk.getPayload();
+        if (blk.header.target_addr + payload.len <= ipc_end) continue;
         @memcpy(image[blk.header.target_addr - lo ..][0..payload.len], payload);
     }
     return .{ .load_addr = lo, .image = image, .descriptor_offset = (descriptor orelse return error.NoDescriptor) - lo };
 }
 
-/// Load `file` both ways into zeroed RAM buffers and check they match.
+/// Load `file` both ways into zeroed RAM buffers and check they match above
+/// the IPC block (below it the UF2 path also writes the dropped ELF-header
+/// blocks, which the OS clears at cart start).
 fn expectSlotMatchesUf2(file: []const u8, slot_area: []const u8) !void {
     const via_uf2 = try TestRam.init(0);
     defer via_uf2.deinit();
@@ -390,15 +413,21 @@ fn expectSlotMatchesUf2(file: []const u8, slot_area: []const u8) !void {
     const off_uf2 = try uf2LoadRam(file, via_uf2.memory());
     const off_slot = try beam_slot.loadInto(slot_area, via_slot.memory());
     try testing.expectEqual(off_uf2, off_slot);
-    try testing.expect(std.mem.eql(u8, via_uf2.bytes, via_slot.bytes));
+    const from = ipc_end - ram.start;
+    try testing.expect(std.mem.eql(u8, via_uf2.bytes[from..], via_slot.bytes[from..]));
+    // The slot never writes below the IPC end.
+    for (via_slot.bytes[0..from]) |b| try testing.expectEqual(@as(u8, 0), b);
 }
 
 test "slot and UF2 load the same RAM (synthetic cart with a gap)" {
     const c: Cart = .{ .load_addr = 0x20035100, .len = 0x300, .desc_off = 0, .bss_start = 0x20035800, .bss_end = 0x20035900 };
     var img_buf: [0x1000]u8 = undefined;
     const img = c.image(&img_buf);
-    // Two blocks, then a 0x100 gap, then a short last block; out of order.
+    // An ELF-header block in the IPC block (dropped), two blocks, then a
+    // 0x100 gap, then a short last block.
+    const elf_header: [0x100]u8 = @splat(0x7F);
     const file = try makeUf2(&.{
+        .{ 0x20030000, &elf_header },
         .{ 0x20035100, img[0..0x100] },
         .{ 0x20035200, img[0x100..0x200] },
         .{ 0x20035400, img[0x200..0x280] },
@@ -414,6 +443,13 @@ test "slot and UF2 load the same RAM (synthetic cart with a gap)" {
     const area = try makeSlot(flat.image, flat.load_addr, flat.descriptor_offset);
     defer testing.allocator.free(area);
     try expectSlotMatchesUf2(file, area);
+
+    // A block straddling the IPC end makes the UF2 non-transferable.
+    const straddle = try makeUf2(&.{
+        .{ 0x20035080, img[0..0x100] },
+    });
+    defer testing.allocator.free(straddle);
+    try testing.expectError(error.NotTransferable, flatten(straddle));
 }
 
 fn readFixture(name: []const u8) ![]u8 {
@@ -430,6 +466,8 @@ test "fixture: snouty-pong.uf2 through this flattener loads like the UF2" {
     defer testing.allocator.free(file);
     const flat = try flatten(file);
     defer flat.deinit();
+    // Its ELF-header blocks at 0x20030000 are dropped: the cart starts at the IPC end.
+    try testing.expectEqual(ipc_end, flat.load_addr);
     const area = try makeSlot(flat.image, flat.load_addr, flat.descriptor_offset);
     defer testing.allocator.free(area);
     try expectSlotMatchesUf2(file, area);
@@ -448,7 +486,7 @@ test "fixture: beam_slot_pong.bin (monorepo flattener) loads like snouty-pong.uf
     @memset(area, 0xFF);
     @memcpy(area[0..slot.len], slot);
 
-    const h = try beam_slot.parseHeader(area[0..96], area_size, ram);
+    const h = try beam_slot.parseHeader(area[0..96], area_size, image_region);
     try testing.expectEqual(@as(u32, @intCast(file.len)), h.source_size);
     // Same image, load address and descriptor as the spec flattening.
     const flat = try flatten(file);

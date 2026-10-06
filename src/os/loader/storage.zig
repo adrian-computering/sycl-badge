@@ -3,6 +3,7 @@
 const std = @import("std");
 const rom = @import("../drivers/rom.zig");
 const ext_flash = @import("../drivers/ext_flash.zig");
+const beam_slot = @import("beam_slot.zig");
 const fat = @import("../drivers/fat.zig");
 const log = std.log.scoped(.storage);
 
@@ -541,9 +542,32 @@ fn flushPending() linksection(".ram_text") void {
     pending_dirty = false;
 }
 
-/// Visit every cart on every volume (main volume first).
+/// Visit every cart on every volume (main volume first), then the
+/// received-cart slot if it holds a valid cart.
 pub fn listCarts(callback: *const fn (name: []const u8, size: u32) void) void {
     for (volumes[0..volume_count], 0..) |*v, index| listCartsIn(v, @intCast(index), callback);
+    if (beam_slot.validHeader()) |h| {
+        var name_buf: [beam_slot.listed_name_max]u8 = undefined;
+        visiting = .{ .volume = beam_slot.volume_id, .start_cluster = 0, .size = h.image_len };
+        callback(h.listedName(&name_buf), h.image_len);
+    }
+}
+
+/// CartInfo for the received-cart slot; long_name is its listed name.
+fn slotCartInfo(h: *const beam_slot.Header) CartInfo {
+    var info: CartInfo = .{
+        .volume = beam_slot.volume_id,
+        .start_cluster = 0,
+        .size = h.image_len,
+        .short_name = @splat(0),
+        .long_name = undefined,
+        .long_name_len = 0,
+    };
+    var name_buf: [beam_slot.listed_name_max]u8 = undefined;
+    const name = h.listedName(&name_buf);
+    @memcpy(info.long_name[0..name.len], name);
+    info.long_name_len = name.len;
+    return info;
 }
 
 fn listCartsIn(v: *const Volume, index: u8, callback: *const fn (name: []const u8, size: u32) void) void {
@@ -600,6 +624,12 @@ pub fn countCarts(first_cart: ?*CartInfo) u32 {
     var count: u32 = 0;
     for (volumes[0..volume_count], 0..) |*v, index| {
         count += countCartsIn(v, @intCast(index), if (count == 0) first_cart else null);
+    }
+    if (beam_slot.validHeader()) |h| {
+        if (count == 0) if (first_cart) |fc| {
+            fc.* = slotCartInfo(&h);
+        };
+        count += 1;
     }
     return count;
 }
@@ -666,10 +696,15 @@ fn countCartsIn(v: *const Volume, index: u8, first_cart: ?*CartInfo) u32 {
     return count;
 }
 
-/// Find a cart by long or short name, main volume first.
+/// Find a cart by long or short name, main volume first, then the
+/// received-cart slot by its listed name.
 pub fn findCart(name: []const u8) ?CartInfo {
     for (volumes[0..volume_count], 0..) |*v, index| {
         if (findCartIn(v, @intCast(index), name)) |info| return info;
+    }
+    if (beam_slot.validHeader()) |h| {
+        var name_buf: [beam_slot.listed_name_max]u8 = undefined;
+        if (std.ascii.eqlIgnoreCase(name, h.listedName(&name_buf))) return slotCartInfo(&h);
     }
     return null;
 }

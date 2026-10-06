@@ -264,6 +264,16 @@ pub fn loadUF2CartEntry(entry: storage.CartEntry) LoadError!mailbox.MessageType.
 fn loadUF2CartInfo(cart_info: storage.CartInfo) LoadError!mailbox.MessageType.CartExecute {
     errdefer cart_state.set_state(.error_state, @src());
 
+    // The received-cart slot is a RAM image, not a UF2 file.
+    if (cart_info.volume == beam_slot.volume_id) {
+        const start_info = try beam_slot.loadSlot();
+        @memcpy(&loaded_cart_name, &cart_info.short_name);
+        loaded_cart_size = cart_info.size;
+        cart_entry_point = start_info;
+        cart_state.set_state(.ready, @src());
+        return start_info;
+    }
+
     // Validate size (UF2 blocks are 512 bytes each, cart_xip is 256KB)
     // Max useful data per block is 256 bytes, so max UF2 file size is roughly 2x cart_xip size
     const max_uf2_size = (getCartXipSize() + getCartRamSize()) * 2;

@@ -218,12 +218,13 @@ pub fn build(b: *Build) void {
         }),
     });
     // The USB code under test imports microzig for its descriptor types
-    unit_tests.root_module.addImport("microzig", b.createModule(.{
+    const microzig_host = b.createModule(.{
         .root_source_file = b.path("src/os/tests/microzig_host.zig"),
         .imports = &.{.{ .name = "mz_core", .module = b.createModule(.{
             .root_source_file = mz_dep.builder.dependency("core", .{}).path("src/core.zig"),
         }) }},
-    }));
+    });
+    unit_tests.root_module.addImport("microzig", microzig_host);
     // Test fixtures are optional files read at run time (tests skip without them).
     const test_options = b.addOptions();
     test_options.addOptionPathDirectory("fixtures_dir", b.path("src/os/tests/fixtures"));
@@ -234,6 +235,19 @@ pub fn build(b: *Build) void {
     const test_step = b.step("test", "");
     test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&kernel.exe.step);
+
+    // Cart files: FAT images for real FAT tools (src/os/tests/fat_images.py).
+    const fat_images = b.addExecutable(.{
+        .name = "fat-images",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/os/fat_images.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    fat_images.root_module.addImport("microzig", microzig_host);
+    const fat_images_step = b.step("fat-images", "Build the host tool src/os/tests/fat_images.py runs");
+    fat_images_step.dependOn(&b.addInstallArtifact(fat_images, .{}).step);
 
     const calc_version = b.addExecutable(.{
         .name = "calc_version",

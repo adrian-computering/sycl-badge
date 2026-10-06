@@ -16,7 +16,8 @@ add a row in the same commit.
 | 2 | `ext_flash` | fork `feature/ext-flash` ([EXT_FLASH.md](EXT_FLASH.md)), e2.3 and later |
 | 3-4 | `ext_volume` (0 none, 1 kept, 2 formatted, 3 unstable) | fork `feature/ext-flash` |
 | 5 | `cart_transfer` | fork `feature/cart-transfer` ([CART_TRANSFER.md](CART_TRANSFER.md)) |
-| 6-15 | free | |
+| 6 | `cart_files` | fork `feature/cart-files` ([CART_FILES.md](CART_FILES.md)) |
+| 7-15 | free | |
 
 ## Spare words (upstream `_reserved: [3]u32`)
 
@@ -36,6 +37,7 @@ instead, the way cart saves do, and gets its row below.
 | `0x25`, `0x26`, `0x29`, `0x2A` | framebuffer, trace, audio, time | upstream |
 | `0x2B` | `EXT_FLASH_REQ` / `EXT_FLASH_DONE` | fork `feature/ext-flash` |
 | `0x2C` | `CART_SAVE_REQ` | fork `feature/cart-saves` ([CART_SAVES.md](CART_SAVES.md)) |
+| `0x2D` | `CART_FILE_REQ` | fork `feature/cart-files` ([CART_FILES.md](CART_FILES.md)) |
 
 ## Rules
 

@@ -169,6 +169,20 @@ with the free range becoming `6-15`.
 - Build: `zig build -Dsimulator=false`, and the full build including the
   simulator.
 
+## Open: ELF headers in RAM cart UF2s
+
+Carts built by the monorepo (checked: `snouty-pong.uf2`) carry two UF2
+blocks at `0x20030000` holding the ELF and program headers (the first
+`LOAD` segment includes them), inside the IPC block (`0x20020000` up to
+`0x20035100`). The UF2 loader copies them there and the OS clears the IPC
+block at cart start. Under format v1 they set `load_addr = 0x20030000`, so
+every image carries a ~20 KB zero gap before the cart at `0x20035100`
+(pong: 44544-byte image for ~23 KB of cart), and the largest transferable
+cart shrinks from 252 KB to about 232 KB. Loading is still correct and
+byte-identical to the UF2 path. Possible fixes, both outside format v1's
+current text: the flattener skips blocks below `0x20035100` (they never
+reach a running cart), or the cart link stops loading the headers.
+
 ## Hardware check
 
 See the monorepo `carts/snouty-beam/PLAN.md` (two badges on fork firmware

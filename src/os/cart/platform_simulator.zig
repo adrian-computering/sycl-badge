@@ -83,6 +83,10 @@ pub fn ext_flash_volume() u8 {
     return 0;
 }
 
+pub fn cart_transfer() bool {
+    return false;
+}
+
 pub fn ext_flash_request(op: cart_api.ExtFlashOp, offset: u32, src: u32, len: u32) cart_api.ExtFlashStatus {
     _ = .{ op, offset, src, len };
     return .unsupported;

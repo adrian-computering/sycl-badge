@@ -5,6 +5,7 @@
 const std = @import("std");
 const microzig = @import("microzig");
 const storage = @import("storage.zig");
+const beam_slot = @import("beam_slot.zig");
 const uf2 = @import("uf2.zig");
 const interrupt = microzig.interrupt;
 const terry = @import("../system/terry.zig");
@@ -183,6 +184,16 @@ pub fn loadUF2CartEntry(entry: storage.CartEntry) LoadError!mailbox.MessageType.
 fn loadUF2CartInfo(cart_info: storage.CartInfo) LoadError!mailbox.MessageType.CartExecute {
     errdefer cart_state.set_state(.error_state, @src());
 
+    // The received-cart slot is a RAM image, not a UF2 file.
+    if (cart_info.volume == beam_slot.volume_id) {
+        const start_info = try beam_slot.loadSlot();
+        @memcpy(&loaded_cart_name, &cart_info.short_name);
+        loaded_cart_size = cart_info.size;
+        cart_entry_point = start_info;
+        cart_state.set_state(.ready, @src());
+        return start_info;
+    }
+
     // Validate size (UF2 blocks are 512 bytes each with up to 256 payload bytes,
     // so a UF2 that fills process RAM is about 2x its size)
     const max_uf2_size = getCartRamSize() * 2;
@@ -273,9 +284,7 @@ fn loadUF2FromStorage(cart_info: storage.CartInfo) LoadError!mailbox.MessageType
         } else if (target >= cart_ram_start and target + payload.len <= cart_ram_end) {
             if (ram_cart_descriptor == null) {
                 // See if we can find the cart descriptor
-                const data_as_u32 = std.mem.bytesAsSlice(u32, payload[0..std.mem.alignBackward(usize, payload.len, @alignOf(u32))]);
-                if (std.mem.indexOfScalar(u32, data_as_u32, abi.CART_MAGIC)) |index| {
-                    const byte_offset = index * @sizeOf(u32);
+                if (beam_slot.findDescriptor(payload)) |byte_offset| {
                     ram_cart_descriptor = @ptrFromInt(target + byte_offset);
                 }
             }
@@ -308,15 +317,15 @@ fn loadUF2FromStorage(cart_info: storage.CartInfo) LoadError!mailbox.MessageType
             const bss_start = @intFromPtr(descriptor.bss_start);
             const bss_end = @intFromPtr(descriptor.bss_end);
             const entry_point = @intFromPtr(descriptor.entry_point);
-            // Verify the pointers
-            if (bss_start < cart_ram_start or bss_start > cart_ram_end or
-                bss_end < cart_ram_start or bss_end > cart_ram_end or
-                bss_start > bss_end or
-                !(entry_point >= cart_ram_start and entry_point < cart_ram_end) or
-                entry_point & 1 == 0) // entry_point must be thumb
-            {
-                return LoadError.AddressMismatch;
-            }
+            // Verify the pointers (rule shared with the received-cart slot;
+            // XIP carts are gone, so the entry point must be in cart RAM)
+            try beam_slot.checkDescriptorV1(
+                bss_start,
+                bss_end,
+                entry_point,
+                .{ .start = cart_ram_start, .end = cart_ram_end },
+                beam_slot.no_xip,
+            );
 
             // Clear BSS
             const bss = @as([*]u8, @ptrFromInt(bss_start))[0 .. bss_end - bss_start];

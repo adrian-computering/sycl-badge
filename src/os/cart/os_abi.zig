@@ -81,7 +81,11 @@ pub const CartIPCData = extern struct {
         /// What boot did with the external drive: 0 none, 1 kept,
         /// 2 formatted, 3 reads unstable so not mounted.
         ext_volume: u2 = 0,
-        _reserved: u11 = 0,
+        /// The OS lists and launches the received-cart slot in the
+        /// external flash's cart area (fork/CART_TRANSFER.md). Only set
+        /// together with ext_flash.
+        cart_transfer: bool = false,
+        _reserved: u10 = 0,
     },
 
     cart_dma_channels: u16,            // x150EC..x150EE

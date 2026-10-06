@@ -15,6 +15,7 @@ fork features detect stock firmware at run time and degrade gracefully.
 | Network lobby (`badge lobby --listen/--tailcat`, `badge join`: badges on different laptops share a lobby over a LAN or the internet via [tailcat](https://github.com/tailscale/tailcat)) | `feature/net-lobby` (on `feature/cart-serial`) | merged (simulator-tested through real tailcat; untested on hardware) | [fork/NET_LOBBY.md](fork/NET_LOBBY.md) |
 | External flash (the board's unused 2 MB QSPI chip: a second USB drive `SYCLEXTRA`, carts read it at `0x11000000` and write its last 256 KB through `cart.ext_flash_*`) | `feature/ext-flash` | merged (drive, carts from it and power cycles tested on one badge; cart writes untested) | [fork/EXT_FLASH.md](fork/EXT_FLASH.md) |
 | Cart saves (`cart.save_*`: named blobs kept in internal flash across power-off; the loader refuses XIP UF2s) | `feature/cart-saves` | merged (host-tested incl. power-cut sweeps; untested on hardware) | [fork/CART_SAVES.md](fork/CART_SAVES.md) |
+| Cart transfer (lists and launches a cart another badge sent over the link cable: a RAM image in the external flash's cart area, slot format v1, shown in the menu as `*Name`; `os_flags` bit 5; the sending/receiving cart is Snouty Beam in the snouty-badge repo) | `feature/cart-transfer` (on `feature/ext-flash`) | merged (host-tested; untested on hardware) | [fork/CART_TRANSFER.md](fork/CART_TRANSFER.md) |
 
 The USB console comes from Carl Sverre's upstream PRs #159 and #160, merged
 as-is so upstream can tell them apart.

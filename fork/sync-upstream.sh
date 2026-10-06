@@ -17,6 +17,7 @@ FEATURES=(
   feature/net-lobby:feature/cart-serial
   feature/ext-flash:upstream/main
   feature/cart-saves:upstream/main
+  feature/cart-transfer:feature/ext-flash
 )
 IN_PROGRESS=(
 )

@@ -15,7 +15,8 @@ add a row in the same commit.
 | 1 | `cart_serial_supported` | fork `feature/cart-serial` ([CART_SERIAL.md](CART_SERIAL.md)) |
 | 2 | `ext_flash` | fork `feature/ext-flash` ([EXT_FLASH.md](EXT_FLASH.md)), e2.3 and later |
 | 3-4 | `ext_volume` (0 none, 1 kept, 2 formatted, 3 unstable) | fork `feature/ext-flash` |
-| 5-15 | free | |
+| 5 | `cart_transfer` | fork `feature/cart-transfer` ([CART_TRANSFER.md](CART_TRANSFER.md)) |
+| 6-15 | free | |
 
 ## Spare words (upstream `_reserved: [3]u32`)
 

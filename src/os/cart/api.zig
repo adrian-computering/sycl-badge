@@ -224,6 +224,13 @@ pub fn ext_flash_volume() u8 {
     return platform.ext_flash_volume();
 }
 
+/// True when the OS lists and launches a cart written to the received-cart
+/// slot at the start of ext_flash_cart_area() (fork/CART_TRANSFER.md, slot
+/// format v1). Implies ext_flash() is non-null.
+pub fn cart_transfer() bool {
+    return platform.cart_transfer();
+}
+
 pub const ExtFlashError = error{ Unsupported, OutOfRange, Misaligned, BadBuffer };
 
 /// Wire format of external flash requests (see os_abi.EXT_FLASH_REQ).
